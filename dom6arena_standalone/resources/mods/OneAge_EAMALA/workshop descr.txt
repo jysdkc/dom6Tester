@@ -1,0 +1,4 @@
+A simple mod which puts all vanilla nations into the Middle Age so they can play together. Each nation is identified as being from its original era and should have a recognisably distinct flag and appropriate fort technology.
+Originally compiled by Zonk, then given vulgar nation tags by your homeboy jBrereton, updated for dom6 by Sombre
+
+Compatibility: Should be compatible with all other mods, provided they do not interfere with the IDs of base game nations. Will not change the age of any mod nation.

@@ -1,0 +1,58 @@
+{
+  "_说明": "json中无法写注释，用' _ '代替",
+
+  "arena": {
+    "_说明": "save 填要拷贝文档的名字；测试存档名固定为 save + \"Arena\"",
+    "save": "Bananas",
+    "map": "ww21duel",
+    "own_nation": 70,
+    "_own_nation说明": "这个填要测的己方国家，己方国家直接拷贝当前bless，测试存档中敌我都可以控制",
+    "enemy_nation": 22,
+    "_enemy_nation说明": "敌方国家不能为空，可以随便填，比如测试开荒的时候。但是敌人填错了bless就拷贝错",
+    "era": 2,
+    "_era说明": "因为测试用的全时代就填2不要动，先保留这个参数",
+    "recreate": true
+  },
+
+  "game_dir": "../Dominions6.exe",
+
+  "player": {
+    "pretender": {},
+    "_pretender说明":"己方伪神通常不用配，会自动拷贝到首都，但有时后神没醒拷贝不了，就按照模板手动指定一下",
+    "provinces": [197,194],
+    "_provinces说明":"这个是完全拷贝己方xx省的全部单位，装备，脚本。可以多省份，包括被压的城",
+    "start_province": 1,
+    "_start_province说明":"测试地图上1 2 3 4 陆省，5，6，7海省 8，9 10地下，水国海陆搞错会创建不了。" ,
+    "target_province": 1,
+    "_target_province说明":"target_province 默认与 start_province 相同，不同则复制的单位放在 target_province。有时候要测试水国的陆上部队，放首都会死。" ,
+    "extra_units": [{"id": 559, "count": 3, "as_commander": true}
+    ],
+    "_extra_units说明":"这个是配地图上不存在的单位，就按照模板配，不填path就用原生的path。因为有gor的情况，as_commander还是要配"
+  },
+
+  "enemy": {
+    "pretender":  {
+      "id": 3368, "magic_paths": { "F": 4, "A": 4, "W": 2, "E": 2, "S": 4, "D": 2, "N": 3, "B": 2, "H": 0 }
+  },
+    "_pretender说明":"敌方伪神建议手动指定一下，因为当前回合不一定拷贝的到。而且因为手上没有找到相关存档，我还没有测试从战报拷贝伪神",
+    "start_province": 2,
+    "target_province": 2,
+    "scout_province": [158],
+    "_scout_province说明": "侦察报告可以填多个省的。报告里若出现伪神单位（包括中立泰坦）就会按照原生模板设为敌方伪神。测试过了压城的侦察报告没有问题。",
+    "battle_report": [],
+    "_battle_report说明": "战报按模板配置，只复制“攻/防”一方。复制战报中的野怪一方要填0，注意不要测special monster的战报，会报错。",
+    "extra_units": [
+      {"id": 559, "count": 3, "as_commander": true},
+      {"id": 1256, "count": 1, "magic_paths": { "F": 4, "A": 4, "W": 2, "E": 2, "S": 4, "D": 2, "N": 3, "B": 2, "H": 3 }}
+  ],
+    "_extra_units说明": "填magic_paths就强制为将领。注意因为测试存档必须host一回合，配置horror有概率跑掉"
+  },
+
+  "mods": [
+    "OneAge_EAMALA/OneAge_EAMALA.dm",
+    "Debug6.dm"
+  ],
+
+  "host": true,
+  "_host说明": "必须 true：客户端（游戏界面）读的是 .trn 而不是 ftherlnd，只有 host 一回合引擎才会用改好的 ftherlnd 重新生成 .trn，复制的军队/指挥官/squad/脚本才能在游戏里看到。host 后存档在第 2 回合，兵力不变（双方不下令，只结算收入）；false 时 .trn 仍是引擎创建时的原始军队，复制内容在游戏里不可见"
+}
