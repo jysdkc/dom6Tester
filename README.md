@@ -1,15 +1,19 @@
 目前仅限原版，de战锤还没试
+
 创建arena存档以后不要一边开着这个测试存档一边又执行创建，会卡住。开其他存档没有影响
+
 ## 安装
 1.整个项目拷贝到dominons6安装目录下
 
 2.拷贝resources下地图和mod到
+
 %APPDATA%\Dominions6\
 
 项目中的pretender_placeholder.2h不要动
 
 ## 基本配置
 所有配置都在arena_config.json里面。
+
 必须要配的就是:
 
 <span style="color:#EE0000">arena.save</span> 这个是要测试的存档名称，大部分报错都是这个没配好。
@@ -22,6 +26,7 @@ player.provinces  player.battle_report  player.extra_units 这几个是拷贝侦
 
 ## 运行
 在dom6arena目录下输入：
+
 python -m dom6arena.arena_build "arena_config.json"
 
 ## 配置文件说明
