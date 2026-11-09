@@ -3,11 +3,11 @@
 创建arena存档以后不要一边开着这个测试存档一边又执行创建，会卡住。开其他存档没有影响
 
 ## 安装
-1.整个项目拷贝到dominons6安装目录下
+1.dom6arena_standalone目录拷贝到dominons6安装目录下
 
-2.拷贝resources下地图和mod到
+2.分别拷贝resources下的map和mod到
 
-%APPDATA%\Dominions6\
+%APPDATA%\Dominions6\  对应map和mod
 
 项目中的pretender_placeholder.2h不要动
 
