@@ -3,11 +3,9 @@
 创建arena存档以后不要一边开着这个测试存档一边又执行创建，会卡住。开其他存档没有影响
 
 ## 安装
-1.dom6arena_standalone目录拷贝到dominons6安装目录下
+1.把dom6arena_standalone目录拷贝到dominons6安装目录下
 
-2.分别拷贝resources下的map和mod到
-
-%APPDATA%\Dominions6\  对应map和mod
+2.分别拷贝resources下的map和mod到 %APPDATA%\Dominions6\  对应map和mod
 
 项目中的pretender_placeholder.2h不要动
 
@@ -20,9 +18,9 @@
 
 <span style="color:#EE0000">arena.own_nation</span> 是己方国家，这个是读存档的源点，配错了会报错。
 
-<span style="color:#EE0000">player.start_province enemy.start_province</span>配置文件里面是写的陆上出生，海国要改一下，不然会报错
+<span style="color:#EE0000">player.start_province enemy.start_province</span>配置文件里面是写的陆上出生，测海国要改一下出生省份到水省，不然会报错。具体见配置文件注释。
 
-player.provinces  player.battle_report  player.extra_units 这几个是拷贝侦察报告，战报和自定义，具体见配置文件注释。不配不会报错但是就只有debug单位了
+player.provinces  player.battle_report  player.extra_units 这几个是拷贝侦察报告，战报和添加自定义单位，具体见配置文件注释。不配不会报错但是就只有debug单位了。
 
 ## 运行
 在dom6arena目录下输入：
