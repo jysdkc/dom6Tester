@@ -11,6 +11,7 @@
 ## 基本配置
 所有配置都在arena_config.json里面。
 必须要配的就是:
+
 <span style="color:#EE0000">arena.save</span> 这个是要测试的存档名称，大部分报错都是这个没配好。
 
 <span style="color:#EE0000">arena.own_nation</span> 是己方国家，这个是读存档的源点，配错了会报错。
