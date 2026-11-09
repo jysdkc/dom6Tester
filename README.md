@@ -10,8 +10,11 @@
 
 ## 基本配置
 所有配置都在arena_config.json里面。
-必须要配的就是<span style="color:#EE0000">arena.save</span> 这个是要测试的存档名称，大部分报错都是这个没配好。
+必须要配的就是:
+<span style="color:#EE0000">arena.save</span> 这个是要测试的存档名称，大部分报错都是这个没配好。
+
 <span style="color:#EE0000">arena.own_nation</span> 是己方国家，这个是读存档的源点，配错了会报错。
+
 <span style="color:#EE0000">player.start_province enemy.start_province</span>配置文件里面是写的陆上出生，海国要改一下，不然会报错
 
 player.provinces  player.battle_report  player.extra_units 这几个是拷贝侦察报告，战报和自定义，具体见配置文件注释。不配不会报错但是就只有debug单位了
