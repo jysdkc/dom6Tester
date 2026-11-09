@@ -1,4 +1,4 @@
-目前仅限原版，de战锤还没试
+目前仅限原版，de战锤还没试。目前仅支撑Windows
 
 创建arena存档以后不要一边开着这个测试存档一边又执行创建，会卡住。开其他存档没有影响
 
@@ -23,7 +23,7 @@
 player.provinces  player.battle_report  player.extra_units 这几个是拷贝侦察报告，战报和添加自定义单位，具体见配置文件注释。不配不会报错但是就只有debug单位了。
 
 ## 运行
-在dom6arena目录下输入：
+windows控制台进入到dom6arena_standalone目录中，输入：
 
 python -m dom6arena.arena_build "arena_config.json"
 
