@@ -16,11 +16,17 @@
 
 <span style="color:#EE0000">arena.save</span> 这个是要测试的存档名称，大部分报错都是这个没配好。
 
+
 <span style="color:#EE0000">arena.own_nation</span> 是己方国家，这个是读存档的源点，配错了会报错。
+
 
 <span style="color:#EE0000">player.start_province enemy.start_province</span>配置文件里面是写的陆上出生，测海国要改一下出生省份到水省，不然会报错。具体见配置文件注释。
 
-player.provinces  player.battle_report  player.extra_units 这几个是拷贝侦察报告，战报和添加自定义单位，具体见配置文件注释。不配不会报错但是就只有debug单位了。
+
+player.provinces 这个是拷贝省份兵力，敌人就是从侦察报告，如果有战斗需要在控制台选，可以精确复制战斗一方的单位、装备、宝石、脚本。不配不会报错但是就只有debug单位了
+
+
+player.extra_units 这个是添加自定义单位，具体见配置文件注释。默认不用配。
 
 ## 运行
 windows控制台进入到dom6arena_standalone目录中，输入：
@@ -35,9 +41,6 @@ python -m dom6arena.arena_build "arena_config.json"
 
 {"id": 3368, "magic_paths": { "F": 4, "A": 4, "W": 2, "E": 2, "S": 4, "D": 2, "N": 3, "B": 2, "H": 0 }}
 
-读战报模板，战报是根据省份id，攻击方id，防御方id，顺序来获取的，这是有时候刺杀、仪式战斗、撞车会有同个省n多战报。seq是从上往下数，默认0。seq只有在同省份同攻防国家都重复的时候才要改，顺序是数重复的战报:
-
-{"province": 207, "attacker": 127, "defender": 124, "copy": "attacker", "seq": 0}
 
 配置地图上没有的单位，模板是这个说明见配置文件注释:
 
