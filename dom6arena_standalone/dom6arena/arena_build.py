@@ -1417,6 +1417,44 @@ def _check_mods(mods: list[str]) -> None:
             f'check the "mods" entries in the config')
 
 
+# Vanilla nations that start under water (the one-age mods keep the ids).
+_SEA_NATIONS = {40, 41, 42, 43, 44, 85, 86, 87, 88, 89, 125, 126, 127}
+
+
+def _check_start_terrain(map_path: Path,
+                         starts: list[tuple[gamedata.Nation, int, str]]) -> None:
+    """Fail early when a start province's sea/land terrain does not fit the
+    nation placed on it.
+
+    The engine silently drops a ``#specstart`` that violates this (a land
+    nation on a sea province or the reverse) and then aborts with the
+    cryptic "Number of players (2 0) exceeding max value for map (1 1)".
+    Plane-2 (underground) provinces are not checked: they use their own
+    numbering in the separate plane2 file, and a land nation may start
+    underground anyway.
+    """
+    terrain: dict[int, int] = {}
+    for line in map_path.read_text(
+            encoding='utf-8', errors='replace').splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == '#terrain':
+            terrain[int(parts[1])] = int(parts[2])
+    for nation, prov, side in starts:
+        mask = terrain.get(prov)
+        if mask is None:  # plane-2 province, not covered here
+            continue
+        if mask & 4 and nation.id not in _SEA_NATIONS:
+            raise ValueError(
+                f'{side} start province {prov} is a sea province, but '
+                f'{nation.id} ({nation.name}) is a land nation: fix the '
+                f'{side} start_province in the config')
+        if not mask & 4 and nation.id in _SEA_NATIONS:
+            raise ValueError(
+                f'{side} start province {prov} is a land province, but '
+                f'{nation.id} ({nation.name}) is a water nation: fix the '
+                f'{side} start_province in the config')
+
+
 def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
                   enemy_nation: gamedata.Nation, mods: list[str],
                   map_name: str, player_start: int, enemy_start: int,
@@ -1456,6 +1494,9 @@ def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
                        (enemy_nation.id, enemy_start)])
         print(f'map {game}: copied from fixed map {map_name} '
               f'(starts {player_start} / {enemy_start})')
+    _check_start_terrain(staged / f'{game}.map',
+                         [(player_nation, player_start, 'player'),
+                          (enemy_nation, enemy_start, 'enemy')])
     if (save / 'ftherlnd').exists():
         print(f'arena {game} already exists, reusing ftherlnd')
         return
@@ -1841,6 +1882,80 @@ def _report_units(raw: bytes, entries, side: str) -> list[int]:
     return _report_details(raw, entries, side)[0]
 
 
+def _pick_battle_reports(raw: bytes, provs) -> list[dict]:
+    """Interactively pick one battle report per scout province.
+
+    Every battle report whose province is listed in ``enemy.provinces``
+    is offered.  Each report is shown as ``[seq, name, uuid, attacker,
+    defender]``: the seq is a 1-based counter per province, the uuid is the
+    VCR offset that later pinpoints the report inside the .trn, attacker and
+    defender are the nation names, and the name is 'battle' or
+    'assassinate'.  The .trn stores no battle title text, but assassination
+    reports are the follow-up VCR records written after the province's main
+    battle: their primary province field is 0 (the real province sits at
+    +39) and the u32 at +31 is 1.  Verified against ground truth in
+    saltedfish_reborn province 95 (1 battle + 5 assassinations) and the four
+    1-commander-vs-1-commander VCRs of Wherecrowfeast.
+
+    The returned dicts carry the usual ``province``/``attacker``/``defender``/
+    ``copy`` keys for ``_report_details``, plus ``seq`` (the report's 0-based
+    index at that province) so a province with several battles between the
+    same nations still resolves to exactly the picked report.
+    """
+    picked: list[dict] = []
+
+    def _nat_name(nation: int) -> str:
+        nat = gamedata.nations().get(nation)
+        if nat:
+            return nat.name
+        return 'Independents' if nation == 0 else str(nation)
+
+    for prov in provs:
+        prov = int(prov)
+        reports = trn_parse.battle_reports(raw, prov)
+        if not reports:
+            continue
+        battles = [
+            (i + 1,
+             'assassinate'
+             if struct.unpack_from('<I', raw, rep['vcr'] + 31)[0] else 'battle',
+             rep['vcr'], _nat_name(rep['attacker']), _nat_name(rep['defender']),
+             i, rep)
+            for i, rep in enumerate(reports)]
+        while True:
+            print(f"There are battles in province: '{prov}', "
+                  f'do you want to:')
+            print('0 skip copy battle report')
+            for seq, name, uuid, att_name, def_name, _, _ in battles:
+                print(f'{seq} copy {name} '
+                      f'attacker: {att_name} VS defender: {def_name}')
+            try:
+                n = int(input('> ').strip())
+            except ValueError:
+                n = -1
+            if n == 0:
+                break
+            hit = [b for b in battles if b[0] == n]
+            if not hit:
+                print('input error')
+                continue
+            _, _, _, _, _, rep_index, rep = hit[0]
+            while True:
+                print('1 copy attacker')
+                print('2 copy defender')
+                side_input = input('> ').strip()
+                if side_input in ('1', '2'):
+                    break
+                print('input error')
+            picked.append({'province': prov, 'attacker': rep['attacker'],
+                           'defender': rep['defender'],
+                           'copy': 'attacker' if side_input == '1'
+                           else 'defender',
+                           'seq': rep_index})
+            break
+    return picked
+
+
 def _estimate_scout_counts(entries: list[list], total: int | None) -> None:
     """Fill a scout report's unknown counts in place.
 
@@ -2016,13 +2131,25 @@ def _enemy_army(raw: bytes, enemy_cfg: dict,
                           'cmdr_override': True, 'base': 0})
             army.append(spec if spec is not None else unit_type)
 
-    provs = enemy_cfg.get('scout_province') or []
+    provs = enemy_cfg.get('provinces') or []
     if isinstance(provs, int):
         provs = [provs]
+    # Battle reports are picked interactively (one per scout province), not
+    # read from the config.  The pick is cached on enemy_cfg so the arena
+    # recreation retries of main() do not ask again.  A province whose battle
+    # report the user picked is not scout-copied as well.
+    if '_battle_report_picks' not in enemy_cfg:
+        enemy_cfg['_battle_report_picks'] = _pick_battle_reports(raw, provs)
+    battle_pick_provs = {int(p['province'])
+                         for p in enemy_cfg['_battle_report_picks']}
     overrides = {_unit_id(k): int(v)
                  for k, v in (enemy_cfg.get('scout_extra') or {}).items()}
     for prov in provs:
         prov = int(prov)
+        if prov in battle_pick_provs:
+            print(f'  province {prov}: battle report picked; the scout '
+                  f'report is not copied')
+            continue
         where = f'scout report province {prov}'
         report = trn_parse.scout_report(raw, prov)
         entries = [[unit_type, count] for unit_type, count in report.units]
@@ -2102,7 +2229,7 @@ def _enemy_army(raw: bytes, enemy_cfg: dict,
               f'({sorted(set(extra))})')
     army += extra
     report_units, detailed = _report_details(
-        raw, enemy_cfg.get('battle_report') or [], 'enemy')
+        raw, enemy_cfg['_battle_report_picks'], 'enemy')
     if report_records is not None:
         for i, record in enumerate(detailed):
             if record is not None:
