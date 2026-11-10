@@ -35,7 +35,7 @@ python -m dom6arena.arena_build "arena_config.json"
 
 {"id": 3368, "magic_paths": { "F": 4, "A": 4, "W": 2, "E": 2, "S": 4, "D": 2, "N": 3, "B": 2, "H": 0 }}
 
-读战报模板，战报是根据省份id，攻击方id，防御方id，顺序来获取的，这是有时候刺杀、仪式战斗、撞车会有同个省n多战报。seq是从上往下数，默认0:
+读战报模板，战报是根据省份id，攻击方id，防御方id，顺序来获取的，这是有时候刺杀、仪式战斗、撞车会有同个省n多战报。seq是从上往下数，默认0。seq只有在同省份同攻防国家都重复的时候才要改，顺序是数重复的战报:
 
 {"province": 207, "attacker": 127, "defender": 124, "copy": "attacker", "seq": 0}
 
