@@ -549,7 +549,8 @@ def _live_block(buf: bytes, rec_pos: int, design: bytes) -> tuple[int, int]:
     return start, end
 
 
-def _retag_trn_god(buf: bytearray, god_name: str, god_type: int) -> int:
+def _retag_trn_god(buf: bytearray, god_name: str, god_type: int,
+                   nation: int) -> int:
     """Set the pretender's unit type inside a .trn.
 
     The client draws the pretender from its unit record in the turn file, and
@@ -557,6 +558,13 @@ def _retag_trn_god(buf: bytearray, god_name: str, god_type: int) -> int:
     forged god file (a placeholder), even though ftherlnd was given the
     source chassis.  The god's unit id sits behind its name record; every
     copy of that record is retagged.
+
+    The unit id alone does not identify the record: a province intel block in
+    the file header can alias a unit record (its dword happens to equal the
+    god's unit id and the following bytes look like valid type/hp/province
+    fields), and retagging it to the god chassis makes the client abort with
+    ``getland: bad owner``.  Only the real unit record also carries the god's
+    own nation, so hits are filtered on the nation field as well.
 
     Returns the number of records changed.
     """
@@ -574,7 +582,8 @@ def _retag_trn_god(buf: bytearray, god_name: str, god_type: int) -> int:
     data = bytes(buf)
     hits = [pos for pos in range(len(data))
             if trn_parse._looks_like_record(data, pos)
-            and struct.unpack_from('<I', data, pos + 4)[0] == uid]
+            and struct.unpack_from('<I', data, pos + 4)[0] == uid
+            and struct.unpack_from('<H', data, pos + 68)[0] == nation]
     for pos in hits:
         struct.pack_into('<H', buf, pos + 36, god_type)
     return len(hits)
@@ -1286,46 +1295,81 @@ def _copy_fixed_map(game: str, map_name: str) -> Path:
     return dst / f'{game}.map'
 
 
-def _apply_starts(mp: Path, plane2: Path | None,
-                  starts: list[tuple[int, int]]) -> None:
+def _apply_starts(mp: Path, starts: list[tuple[int, int]],
+                  cave_count: int) -> dict[int, int]:
     """Pin each nation to its start province on a staged map.
 
-    ``starts`` is ``[(nation id, province id)]``.  A province only accepts a
-    capital when its terrain mask has no nostart bit (512), so the two start
-    provinces get the bit cleared, every other kept province gets it set.
-    A ``#scenario`` block declares both nations as human players with
-    ``#allowedplayer``, gives EVERY province an ``#owner`` (nearest specstart
-    in the neighbour graph), and declares them enemies with ``#startwar``.
-    The block is inserted before ``#neighbour``, matching the engine contract.
+    ``starts`` is ``[(nation id, province id)]``.  A surface province only
+    accepts a capital when its terrain mask has no nostart bit (512), so the
+    surface start provinces get the bit cleared and every other surface
+    province gets it set.  A ``#scenario`` block declares both nations as human
+    players with ``#allowedplayer``, gives EVERY surface province an ``#owner``
+    (nearest specstart in the neighbour graph), and declares them enemies with
+    ``#startwar``.  The block is inserted before ``#neighbour``, matching the
+    engine contract.
+
+    An underground start is addressed as ``surface_max + cave_local``: the
+    engine numbers plane 2 right after the surface.  ``cave_count`` is the
+    number of provinces the map's ``_plane2.map`` declares, used to bound
+    that id.  The engine ignores the authored cave layer and generates its
+    own at creation, but the generated provinces are all startable and keep
+    that numbering, so the ``#specstart`` is honoured -- as long as the spare
+    surface provinces below keep the engine's player count check happy.
+
+    Returns the computed province ownership dict for later use in fixing
+    ftherlnd's binary owner table.
     """
     from collections import deque
 
     wanted = dict(starts)
     nations = list(wanted.keys())
-    start_provs = set(wanted.values())
-    found: set[int] = set()
+    surface: set[int] = set()
+    terrain_at: dict[int, int] = {}
     body: list[str] = []
     for line in mp.read_text(encoding='utf-8', errors='replace').splitlines():
         parts = line.split()
         head = parts[0] if parts else ''
         if head == '#terrain' and len(parts) >= 3:
-            prov, mask = int(parts[1]), int(parts[2])
-            if prov in start_provs:
-                mask &= ~512
-                found.add(prov)
-            else:
-                mask |= 512
-            line = f'#terrain {prov} {mask}'
+            prov = int(parts[1])
+            surface.add(prov)
+            terrain_at[prov] = len(body)
         elif head in ('#specstart', '#scenario', '#allowedplayer',
                        '#startwar', '#victorycondition', '#owner'):
             continue
         body.append(line)
-    missing = start_provs - found
+    highest = max(surface) if surface else 0
+    surface_starts = {p for _, p in starts if p <= highest}
+    missing = surface_starts - surface
     if missing:
         raise ValueError(
-            f'start province(s) {sorted(missing)} not found in {mp.name}; '
-            f'check player.start_province / enemy.start_province'
+            f'start province(s) {sorted(missing)} are not declared by '
+            f'{mp.name} (which defines 1..{highest}); fix start_province in '
+            f'the config'
         )
+    for _, prov in starts:
+        if prov > highest and prov - highest > cave_count:
+            raise ValueError(
+                f'start province {prov} is underground, but the map has only '
+                f'{cave_count} cave province(s) ({highest + 1}..'
+                f'{highest + cave_count}); fix start_province in the config'
+            )
+    # The engine counts "max land players" on the surface plane only, even for
+    # a nation whose capital is underground.  Marking every other surface
+    # province nonstartable therefore left the count at 1 and creation aborted
+    # with "Number of players (2 0) exceeding max value for map (1 0)".
+    # Enough spare surface provinces stay startable to seat every player; the
+    # pinned #specstart still decides where each nation actually appears.
+    spare = max(0, len(starts) - len(surface_starts))
+    for prov in sorted(terrain_at):
+        mask = int(body[terrain_at[prov]].split()[2])
+        if prov in surface_starts:
+            mask &= ~512
+        elif spare:
+            mask &= ~512
+            spare -= 1
+        else:
+            mask |= 512
+        body[terrain_at[prov]] = f'#terrain {prov} {mask}'
     # Build neighbour graph to assign owners to every province.
     edges: dict[int, set[int]] = {}
     for line in body:
@@ -1369,13 +1413,24 @@ def _apply_starts(mp: Path, plane2: Path | None,
     body[insert_at:insert_at] = scenario
     mp.write_text('\n'.join(body) + '\n', encoding='utf-8')
 
-    if plane2 is not None and plane2.exists():
-        lines = plane2.read_text(encoding='utf-8', errors='replace').splitlines()
-        for i, line in enumerate(lines):
-            parts = line.split()
-            if parts and parts[0] == '#terrain' and len(parts) >= 3:
-                lines[i] = f'#terrain {parts[1]} {int(parts[2]) | 512}'
-        plane2.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return {node: nearest.get(node, (99, nations[0]))[1] for node in nodes}
+
+
+def _cave_count(plane2: Path) -> int:
+    """Provinces the map's ``_plane2.map`` declares.
+
+    The engine does not use that file as authored (see ``_apply_starts``);
+    it generates the cave layer at creation, but the file still defines how
+    many underground provinces the map is meant to have, which is what a
+    ``start_province`` is validated against.
+    """
+    lines = plane2.read_text(encoding='utf-8', errors='replace').splitlines()
+    count = 0
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == '#terrain':
+            count += 1
+    return count
 
 
 def _enabled_mods() -> list[str]:
@@ -1463,9 +1518,11 @@ def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
 
     The map is a fixed, hand made one: ``arena.map`` names a folder under
     ``maps/`` and is copied under the game name as-is, except that the capitals
-    from ``player_start`` / ``enemy_start`` are pinned and every other province
-    is made nonstartable.  ``recreate`` discards the existing save and the
-    staged copy first, so a changed source map is picked up.
+    from ``player_start`` / ``enemy_start`` are pinned and every other surface
+    province is made nonstartable (minus the few spare ones the engine's player
+    count check needs when a capital is underground).  ``recreate`` discards
+    the existing save and the staged copy first, so a changed source map is
+    picked up.
     """
     if not map_name:
         raise ValueError(
@@ -1487,13 +1544,17 @@ def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
         if staged.exists():
             shutil.rmtree(staged)
             print(f'map {staged.name} discarded for recreation')
-    if not (staged / f'{game}.map').exists():
-        staged_map = _copy_fixed_map(game, map_name)
-        _apply_starts(staged_map, staged / f'{game}_plane2.map',
-                      [(player_nation.id, player_start),
-                       (enemy_nation.id, enemy_start)])
+    staged_map = staged / f'{game}.map'
+    if not staged_map.exists():
+        _copy_fixed_map(game, map_name)
         print(f'map {game}: copied from fixed map {map_name} '
               f'(starts {player_start} / {enemy_start})')
+    plane2 = staged / f'{game}_plane2.map'
+    cave_count = _cave_count(plane2) if plane2.exists() else 0
+    _apply_starts(staged_map,
+                  [(player_nation.id, player_start),
+                   (enemy_nation.id, enemy_start)],
+                  cave_count)
     _check_start_terrain(staged / f'{game}.map',
                          [(player_nation, player_start, 'player'),
                           (enemy_nation, enemy_start, 'enemy')])
@@ -1814,14 +1875,29 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
             commander_types = rep['start_commanders'][side_nat]
 
             segment = raw[rep['vcr']:rep['bcd']]
+            # VCR snapshot block: uid → {type, squad, province} for EVERY
+            # unit of side_nat that fought this battle, including ones the
+            # player cannot see (no .trn record).  We use it to fill the
+            # missing slots of invisible troops that would otherwise land
+            # as bare None entries and lose their unit identity AND their
+            # squad attachment when the formation is assembled below.
+            vcr_snaps = _scan_vcr_snapshots(raw, rep['vcr'], rep['bcd'],
+                                            side_nat)
+            vcr_by_type: dict[int, list[int]] = {}
+            for uid, info in vcr_snaps.items():
+                vcr_by_type.setdefault(info['type'], []).append(uid)
+            vcr_used: set[int] = set()
             for t, count in army.items():
                 picked_units += [t] * count
                 candidates_for_type = by_type.get(t, [])
                 mentioned = [r for r in candidates_for_type
                              if struct.pack('<I', r['uid']) in segment]
                 visible = mentioned or candidates_for_type
-                detailed += visible[:count]
-                missing = count - len(visible[:count])
+                picked = visible[:count]
+                detailed += picked
+                for r in picked:
+                    vcr_used.add(r['uid'])
+                missing = count - len(picked)
                 for _ in range(missing):
                     if t in commander_types:
                         com = _take_spare_commander(spare_by_type, t)
@@ -1836,8 +1912,22 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
                         detailed.append({
                             'uid': com['uid'], 'type': t, 'province': prov,
                             'nation': side_nat, 'pos': None, 'com': com})
+                        vcr_used.add(com['uid'])
                     else:
-                        detailed.append(None)
+                        # Troop slot missing from .trn: try to pull a uid
+                        # from the VCR snapshot block so this unit is not
+                        # an anonymous None that later falls out of every
+                        # squad assignment.
+                        pool = [u for u in vcr_by_type.get(t, [])
+                                if u not in vcr_used]
+                        if pool:
+                            uid = pool.pop(0)
+                            vcr_used.add(uid)
+                            detailed.append({
+                                'uid': uid, 'type': t, 'province': prov,
+                                'nation': side_nat, 'pos': None})
+                        else:
+                            detailed.append(None)
         else:
             picked_units = [r['type'] for r in side_records]
             detailed += side_records
@@ -1852,6 +1942,47 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
               f'({sorted(set(picked_units))})')
         units += picked_units
     return units, detailed
+
+
+def _scan_vcr_snapshots(raw: bytes, vcr_start: int, bcd_start: int,
+                        nation: int) -> dict[int, dict]:
+    """Scan VCR snapshot records inside a battle report block.
+
+    A VCR snapshot is a 173-byte ftherlnd-like unit record written before
+    the BCD block.  Field offsets (verified against real saves):
+        +0  u32 unit id
+        +28 u32 squad id (0xFFFFFFFF = commander)
+        +32 u16 unit type
+        +36 u16 province
+        +64 u16 owning nation
+
+    The player's own .trn carries only its own units plus enemies it can
+    see, so the VCR is the *only* source for squad ids and uid/type pairs
+    of unseen enemy units.
+
+    Returns ``{uid: {'type': int, 'squad': int, 'province': int}}`` for
+    every snapshot matching ``nation``.
+    """
+    out: dict[int, dict] = {}
+    seg = raw[vcr_start:bcd_start]
+    if len(seg) < 173:
+        return out
+    pos = 0
+    while pos + 173 <= len(seg):
+        uid = struct.unpack_from('<I', seg, pos)[0]
+        if not (1 <= uid < 10_000_000):
+            pos += 1
+            continue
+        sq = struct.unpack_from('<I', seg, pos + 28)[0]
+        typ = struct.unpack_from('<H', seg, pos + 32)[0]
+        prov = struct.unpack_from('<H', seg, pos + 36)[0]
+        nat = struct.unpack_from('<H', seg, pos + 64)[0]
+        if (typ in gamedata.units()
+                and 1 <= prov <= 5000
+                and nat == nation):
+            out[uid] = {'type': typ, 'squad': sq, 'province': prov}
+        pos += 1
+    return out
 
 
 def _take_spare_commander(pool: dict[int | None, list[dict]],
@@ -3672,12 +3803,40 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                     f'holding type {slot_type}')
             report_uid[r['uid']] = (off - base) // stride + 1
 
+        # Build the squad membership table.  Each unit's "real" squad id
+        # lives in the VCR snapshot block of the battle report (fsterlnd
+        # format: uid at +0, squad at +28).  The player's own .trn only
+        # carries units it can see, so many copied enemy units have no
+        # .trn record at all (pos is None); their squad id must come
+        # from the VCR block instead.  Build that lookup table first.
+        vcr_sq: dict[int, int] = {}
+        for pick in enemy_cfg.get('_battle_report_picks') or []:
+            prov = int(pick['province'])
+            side = pick['copy']
+            rep = [r for r in trn_parse.battle_reports(trn_raw, prov)
+                   if (side == 'attacker' and r['attacker'] == pick.get('attacker'))
+                   or (side == 'defender' and r['defender'] == pick.get('defender'))]
+            if not rep:
+                continue
+            if 'seq' in pick and pick['seq'] < len(rep):
+                rep = rep[pick['seq']]
+            else:
+                rep = rep[0]
+            side_nat = rep[side]
+            snaps = _scan_vcr_snapshots(trn_raw, rep['vcr'], rep['bcd'],
+                                        side_nat)
+            for uid, info in snaps.items():
+                if info['squad'] != 0xFFFFFFFF:
+                    vcr_sq[uid] = info['squad']
+
         stamped: dict[int, list[int]] = {}
         for r in enemy_report_records:
-            if r['pos'] is None:
-                continue
-            sq = struct.unpack_from('<I', trn_raw, r['pos'] + 32)[0]
-            if sq != 0xFFFFFFFF:
+            sq = None
+            if r['pos'] is not None:
+                sq = struct.unpack_from('<I', trn_raw, r['pos'] + 32)[0]
+            if sq is None and r.get('uid') in vcr_sq:
+                sq = vcr_sq[r['uid']]
+            if sq is not None and sq != 0xFFFFFFFF:
                 stamped.setdefault(sq, []).append(r['uid'])
         max_squad = 0
         for k in range(count):
@@ -3702,18 +3861,9 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             n_members = 0
             for sq in com['squads']:
                 members = [u for u in stamped.get(sq, []) if u in report_uid]
-                types = [uid_at[u]['type'] for u in members]
-                if not types:
+                if not members:
                     continue
-                sq_type = Counter(types).most_common(1)[0][0]
-                chosen = [u for u in members
-                          if uid_at[u]['type'] == sq_type
-                          and report_uid[u] not in taken]
-                pool = [u['uid'] for u in enemy_report_records
-                        if u['type'] == sq_type and u['uid'] in report_uid
-                        and report_uid[u['uid']] not in taken
-                        and u['uid'] not in chosen]
-                chosen += pool
+                chosen = [u for u in members if report_uid[u] not in taken]
                 if not chosen:
                     continue
                 max_squad += 1
@@ -3945,7 +4095,8 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                 # kept the arena's own name because only its bless is copied.
                 rec = _design_for_or_none(bytes(buf), arena_nation)
                 god_name = rec['god'] if rec else ''
-                changed = _retag_trn_god(buf, god_name, chosen) if chosen else 0
+                changed = _retag_trn_god(buf, god_name, chosen,
+                                         arena_nation) if chosen else 0
                 if changed:
                     print(f'  pretender unit type {chosen} set in {trn.name} '
                           f'({changed} record(s))')

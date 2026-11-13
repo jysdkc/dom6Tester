@@ -7,7 +7,7 @@
     "map": "ww21duel",
     "own_nation": 70,
     "_own_nation说明": "这个填要测的己方国家，己方国家直接拷贝当前bless，测试存档中敌我都可以控制",
-    "enemy_nation": 105,
+    "enemy_nation": 56,
     "_enemy_nation说明": "敌方国家不能为空，可以随便填，比如测试开荒的时候。但是敌人填错了bless就拷贝错",
     "era": 2,
     "_era说明": "因为测试用的全时代就填2不要动，先保留这个参数",
@@ -17,9 +17,9 @@
   "game_dir": "../Dominions6.exe",
 
   "player": {
-    "pretender": {},
+    "pretender": {"id": 3368, "magic_paths": { "F": 9, "A": 9, "W": 9, "E":9, "S":9, "D": 9, "N": 9, "B": 9, "H": 9 }},
     "_pretender说明":"己方伪神通常不用配，会自动拷贝到首都，但有时后神没醒拷贝不了，就按照模板手动指定一下",
-    "provinces": [161],
+    "provinces": [145],
     "_provinces说明":"这个是完全拷贝己方xx省的全部单位，装备，脚本。可以多省份，包括被压的城",
     "start_province": 1,
     "_start_province说明":"测试地图上1 2 3 4 陆省，5，6，7海省 8，9 10地下，水国海陆搞错会创建不了。" ,
@@ -37,11 +37,13 @@
     "_pretender说明":"敌方伪神建议手动指定一下，因为当前回合不一定拷贝的到。而且因为手上没有找到相关存档，我还没有测试从战报拷贝伪神",
     "start_province": 2,
     "target_province": 2,
-    "provinces": [145],
+    "provinces": [],
     "_provinces说明": "敌人省份可以填多个省的，如果省份中有战报需要在互动中选择拷贝哪个。战报里若出现伪神单位（包括中立泰坦）就会按照原生模板设为敌方伪神。测试过了压城的侦察报告没有问题。",
     "extra_units": [
-      {"id": 559, "count": 3, "as_commander": true},
-      {"id": 1256, "count": 1, "magic_paths": { "F": 4, "A": 4, "W": 2, "E": 2, "S": 4, "D": 2, "N": 3, "B": 2, "H": 3 }}
+      {"id": 41, "count": 5, "as_commander": true},
+      {"id": 538, "count": 128, "as_commander": false},
+	  {"id": 2251, "count": 50, "as_commander": false}
+	  
   ],
     "_extra_units说明": "填magic_paths就强制为将领。注意因为测试存档必须host一回合，配置horror有概率跑掉"
   },
