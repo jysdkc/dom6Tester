@@ -25,7 +25,14 @@ from pathlib import Path
 from . import config
 
 XOR = 0x4F
+# Bound for the heuristic scanners that walk arbitrary bytes (a stray ff ff
+# must not open a fake list).
 MAX_UNIT_TYPE = 6000
+# Bound for readers that take the type from a known field (unit table record,
+# squad block header).  Mods use ids far above 6000 -- Debug6 hands out 9001
+# and 9002 -- so the vanilla-era 6000 silently dropped them from the province
+# reports and the copied-squad checks.
+MAX_ANY_UNIT_TYPE = 65535
 MAX_INSTANCE_ID = 500
 SQUAD_PREFIX = b"\xff\xff\xff\xff"
 
@@ -331,7 +338,8 @@ def find_province_units(raw: bytes, province: int) -> list[UnitRecord]:
         offset = base + index * stride
         unit_type = struct.unpack_from("<H", raw, offset + UNIT_TYPE_OFFSET)[0]
         p1, p2 = struct.unpack_from("<HH", raw, offset + UNIT_PROVINCE_OFFSET)
-        if p1 == province and p2 == province and 0 < unit_type < MAX_UNIT_TYPE:
+        if (p1 == province and p2 == province
+                and 0 < unit_type < MAX_ANY_UNIT_TYPE):
             records.append(UnitRecord(offset=offset, unit_type=unit_type))
     return records
 
@@ -382,7 +390,7 @@ def find_province_squads(raw: bytes, province: int) -> list[SquadBlock]:
             break
         unit_type, hp, p1, p2 = struct.unpack_from("<HHHH", raw, idx + 4)
         if (
-            0 < unit_type < MAX_UNIT_TYPE
+            0 < unit_type < MAX_ANY_UNIT_TYPE
             and p1 == province and p2 == province
         ):
             blocks.append(SquadBlock(offset=idx, unit_type=unit_type, members=[hp, p1, p2]))
