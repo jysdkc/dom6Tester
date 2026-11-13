@@ -1472,40 +1472,21 @@ def _check_mods(mods: list[str]) -> None:
             f'check the "mods" entries in the config')
 
 
-# Vanilla nations whose capital must be a sea province (the one-age mods keep
-# the ids).  Verified against the engine itself: every id was created at the
-# land province 2 of ww21duel, and exactly these ones were rejected.  The land
-# starts 125 (LA Erytheia) and 126 (LA Atlantis) were rejected in the past
-# ("Number of players (2 0) exceeding max value for map (1 1)"): both are
-# coastal nations whose capital is on land, only their troops swim.  Do not
-# add an id here without that check -- a wrong entry hands a land nation a sea
-# capital and the engine drops the #specstart.
+# Vanilla nations that start under water (the one-age mods keep the ids).
 _SEA_NATIONS = {40, 41, 42, 43, 44, 85, 86, 87, 88, 89, 127}
 
 
-def _default_start(nation: gamedata.Nation) -> int:
-    """Start province used when the config leaves ``start_province`` empty.
+def _check_start_terrain(map_path: Path,
+                         starts: list[tuple[gamedata.Nation, int, str]]) -> None:
+    """Fail early when a start province's sea/land terrain does not fit the
+    nation placed on it.
 
-    The fixed maps number land provinces 1..4 and sea provinces 5..7, so the
-    default follows the nation's terrain.  The old flat default of 5 handed a
-    land nation a sea capital and made the engine abort at creation.
-    """
-    return 5 if nation.id in _SEA_NATIONS else 1
-
-
-def _sea_land_mismatches(map_path: Path,
-                         starts: list[tuple[gamedata.Nation, int, str]]
-                         ) -> list[str]:
-    """Describe start provinces whose terrain disagrees with the nation list.
-
-    Only used as a hint after the engine refused to create the game: it
-    silently drops a ``#specstart`` whose province terrain does not fit the
-    nation (a land nation on a sea province or the reverse) and then aborts
-    with the cryptic "Number of players (2 0) exceeding max value for map
-    (1 1)".  ``_SEA_NATIONS`` is hand maintained, so a wrong entry must never
-    reject a config up front -- that blocked a valid LA Atlantis build.
-    Plane-2 (underground) provinces are skipped: they use their own numbering
-    in the separate plane2 file, and a land nation may start underground.
+    The engine silently drops a ``#specstart`` that violates this (a land
+    nation on a sea province or the reverse) and then aborts with the
+    cryptic "Number of players (2 0) exceeding max value for map (1 1)".
+    Plane-2 (underground) provinces are not checked: they use their own
+    numbering in the separate plane2 file, and a land nation may start
+    underground anyway.
     """
     terrain: dict[int, int] = {}
     for line in map_path.read_text(
@@ -1513,21 +1494,20 @@ def _sea_land_mismatches(map_path: Path,
         parts = line.split()
         if len(parts) >= 3 and parts[0] == '#terrain':
             terrain[int(parts[1])] = int(parts[2])
-    notes: list[str] = []
     for nation, prov, side in starts:
         mask = terrain.get(prov)
-        if mask is None:
+        if mask is None:  # plane-2 province, not covered here
             continue
-        sea = bool(mask & 4)
-        if sea != (nation.id in _SEA_NATIONS):
-            wanted = 'sea' if nation.id in _SEA_NATIONS else 'land'
-            got = 'sea' if sea else 'land'
-            notes.append(
-                f'{side} start province {prov} is {got}, but nation '
-                f'{nation.id} ({nation.name}) is listed as starting on '
-                f'{wanted}; set {side}.start_province to a {wanted} province, '
-                f'or fix _SEA_NATIONS in arena_build.py if the list is wrong')
-    return notes
+        if mask & 4 and nation.id not in _SEA_NATIONS:
+            raise ValueError(
+                f'{side} start province {prov} is a sea province, but '
+                f'{nation.id} ({nation.name}) is a land nation: fix the '
+                f'{side} start_province in the config')
+        if not mask & 4 and nation.id in _SEA_NATIONS:
+            raise ValueError(
+                f'{side} start province {prov} is a land province, but '
+                f'{nation.id} ({nation.name}) is a water nation: fix the '
+                f'{side} start_province in the config')
 
 
 def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
@@ -1575,6 +1555,9 @@ def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
                   [(player_nation.id, player_start),
                    (enemy_nation.id, enemy_start)],
                   cave_count)
+    _check_start_terrain(staged / f'{game}.map',
+                         [(player_nation, player_start, 'player'),
+                          (enemy_nation, enemy_start, 'enemy')])
     if (save / 'ftherlnd').exists():
         print(f'arena {game} already exists, reusing ftherlnd')
         return
@@ -1589,28 +1572,11 @@ def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
     # most of it, so a table too small for both armies is retried with a
     # higher value (see main) purely to allocate more records.
     # --research 0: Very easy research, so Construction 1 completes quickly.
-    try:
-        newgame.create(game, era,
-                       [(player_nation, _god_file_for(player_nation)),
-                        (enemy_nation, _god_file_for(enemy_nation))],
-                       mods=mods, indepstr=indepstr,
-                       extra_flags=['--eventrarity', '2', '--research', '0'])
-    except newgame.NewGameError as error:
-        # The engine aborts with "Number of players ... exceeding max value
-        # for map ..." when a #specstart does not fit the nation's terrain.
-        # Turn that into a readable hint, but keep the original error (the
-        # mismatch list is a guess and must not mask another cause).
-        notes = []
-        if ('Number of players' in str(error)
-                or 'exceeding max value' in str(error)):
-            notes = _sea_land_mismatches(
-                staged / f'{game}.map',
-                [(player_nation, player_start, 'player'),
-                 (enemy_nation, enemy_start, 'enemy')])
-        if notes:
-            raise newgame.NewGameError(
-                f'{error}\npossible cause:\n  ' + '\n  '.join(notes)) from error
-        raise
+    newgame.create(game, era,
+                   [(player_nation, _god_file_for(player_nation)),
+                    (enemy_nation, _god_file_for(enemy_nation))],
+                   mods=mods, indepstr=indepstr,
+                   extra_flags=['--eventrarity', '2', '--research', '0'])
     _check_mods(mods)
     if mods:
         print(f'  mods loaded as configured: {[Path(m).name for m in mods]}')
@@ -3037,10 +3003,8 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     fresh = recreate or not (config.save_dir(game) / 'ftherlnd').exists()
     _ensure_arena(game, era, player_nat, enemy_nation, mods,
                   map_name=str(arena.get('map') or '').strip(),
-                  player_start=int(player_cfg.get('start_province')
-                                   or _default_start(player_nat)),
-                  enemy_start=int(enemy_cfg.get('start_province')
-                                  or _default_start(enemy_nation)),
+                  player_start=int(player_cfg.get('start_province') or 1),
+                  enemy_start=int(enemy_cfg.get('start_province') or 5),
                   recreate=recreate, indepstr=indepstr)
 
     save = config.save_dir(game)
@@ -3220,10 +3184,8 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # army is placed; both default to the side's start province.  The old
     # arena.target_province still works as the player's target.
     tp = arena.get('target_province', 'random')
-    player_start = int(player_cfg.get('start_province')
-                       or _default_start(player_nat))
-    enemy_start = int(enemy_cfg.get('start_province')
-                      or _default_start(enemy_nation))
+    player_start = int(player_cfg.get('start_province') or 1)
+    enemy_start = int(enemy_cfg.get('start_province') or 5)
     player_prov = int(player_cfg['target_province']) \
         if player_cfg.get('target_province') is not None \
         else (int(tp) if tp != 'random' else player_start)
@@ -3456,7 +3418,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         e_slots = e_used[1:]
         _apply_master_chain(raw, e_slots, enemy_specs)
         for off in e_left:
-            struct.pack_into('<H', raw, off + 64, own_nation)
+            struct.pack_into('<H', raw, off + 64, 0)
             struct.pack_into('<H', raw, off + 32, 0)
             struct.pack_into('<HH', raw, off + 36, player_prov, player_prov)
         p_god, p_used, p_left = _write_nation_army(
@@ -3466,6 +3428,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         p_slots = p_used[1:]
         _apply_master_chain(raw, p_slots, src_specs)
         for off in p_left:
+            struct.pack_into('<H', raw, off + 64, 0)
             struct.pack_into('<H', raw, off + 32, 0)
             struct.pack_into('<HH', raw, off + 36, player_prov, player_prov)
     else:
@@ -3476,7 +3439,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         p_slots = p_used[1:]
         _apply_master_chain(raw, p_slots, src_specs)
         for off in p_left:
-            struct.pack_into('<H', raw, off + 64, enemy_nation.id)
+            struct.pack_into('<H', raw, off + 64, 0)
             struct.pack_into('<H', raw, off + 32, 0)
             struct.pack_into('<HH', raw, off + 36, enemy_prov, enemy_prov)
         e_god, e_used, e_left = _write_nation_army(
@@ -3486,6 +3449,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         e_slots = e_used[1:]
         _apply_master_chain(raw, e_slots, enemy_specs)
         for off in e_left:
+            struct.pack_into('<H', raw, off + 64, 0)
             struct.pack_into('<H', raw, off + 32, 0)
             struct.pack_into('<HH', raw, off + 36, enemy_prov, enemy_prov)
 

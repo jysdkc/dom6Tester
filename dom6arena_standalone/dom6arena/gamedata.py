@@ -141,8 +141,14 @@ def pretenders() -> dict[int, set[int]]:
     ``Pretenders`` category (``if (attr.monster_number != 134)`` in
     MNation.js, commented "Why is royal guard marked as pretender?"), so it
     is dropped here too.
+
+    Generic pretenders (Cyclops, Dragon, Dracolich, ...) are available to
+    many nations and are stored under nation 0 in ``pretenders.csv``.  They
+    are merged into every nation's set so per-nation god detection and
+    ``pretender_chassis()`` both see the complete chassis list.
     """
     result: dict[int, set[int]] = {}
+    generic: set[int] = set()
     for row in _split_rows(DATA_DIR / "pretenders.csv")[1:]:
         try:
             monster, nation = int(row[0]), int(row[1])
@@ -150,7 +156,13 @@ def pretenders() -> dict[int, set[int]]:
             continue
         if monster == ROYAL_GUARD_TROOP:
             continue
-        result.setdefault(nation, set()).add(monster)
+        if nation == 0:
+            generic.add(monster)
+        else:
+            result.setdefault(nation, set()).add(monster)
+    if generic:
+        for nation in result:
+            result[nation] |= generic
     return result
 
 

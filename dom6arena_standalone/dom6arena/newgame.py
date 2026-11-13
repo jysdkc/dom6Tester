@@ -561,7 +561,7 @@ def trn_squads(game: str, nation: gamedata.Nation, era: int,
         if idx < 0 or idx + 12 > len(raw):
             break
         unit_type, hp, p1, p2 = struct.unpack_from("<HHHH", raw, idx + 4)
-        if 0 < unit_type < saveedit.MAX_ANY_UNIT_TYPE and p1 == p2 == province:
+        if 0 < unit_type < saveedit.MAX_UNIT_TYPE and p1 == p2 == province:
             squads.append((unit_type, hp))
         pos = idx + 1
     return squads
