@@ -28,6 +28,14 @@ import sys
 from collections import Counter, deque
 from pathlib import Path
 
+if __package__ in (None, ''):
+    # Started as a plain script (``python dom6arena/arena_build.py ...`` or an
+    # IDE's Run button): the relative imports below need the package parent on
+    # sys.path.  Without this the tool dies with "attempted relative import
+    # with no known parent package".
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = 'dom6arena'
+
 from . import blesses, config, gamedata, newgame, savecrc, saveedit, trn_parse
 
 XOR = 0x4F
@@ -609,6 +617,7 @@ T_PROV = 92
 T_UIDREF = 126
 T_PATHS = 130           # ten bytes: F,A,W,E,S,D,N,G,B,H
 T_ORDER = 140           # one byte; +141 starts the eight gem counts
+T_SQUAD_LAYOUT = 152    # 29 bytes: copied squad layout (ftherlnd) / scripts (.2h)
 PATH_LETTERS = 'FAWESDNGBH'
 
 
@@ -705,18 +714,117 @@ def _source_com(h2_raw: bytes | None, trn_raw: bytes, uid: int
     paths, squads, battle script); the ``.trn`` is the turn-start snapshot and
     one turn older -- the source pretender carries five 1321 items in the .2h
     and none at all in the .trn.  Every copied com record therefore comes from
-    the orders file whenever it has one.  The .trn is only used when the save
-    has no orders file at all: its stale records also false-positive com
-    matches (dead mercenary companies, province names).
+    the orders file whenever it has one.  A commander the .2h does not list
+    falls back to its own .trn record by uid; that is the same unit (the
+    lookup is uid-keyed), not one of the stale-name false positives above.
     """
     com = _trn_commander(h2_raw, uid) if h2_raw else None
-    if com is None and h2_raw is None:
-        com = _trn_commander(trn_raw, uid)
+    if com is not None:
+        return com
+    # The orders file can be stale or omit a commander (e.g. a garrison
+    # locked in a besieged castle).  _trn_commander is uid-keyed, so a
+    # .trn hit for this very uid is the same unit, not a false positive:
+    # without it the commander is copied with no name/equipment at all
+    # (that is how "Meliath the Fortune Teller" went missing).
+    com = _trn_commander(trn_raw, uid)
+    if com is None:
+        return None
+    # A stale text/index block can still pass _trn_commander's loose
+    # "0x4f + uid" test (engine log: "Dagan, the Renegade Sage" at .trn
+    # offset 658507, whose 181-byte body is text, not a com).  A real com
+    # tail holds magic paths as 0..15 at 130..139; a bigger byte means the
+    # hit is garbage -- transplanting it put 26812 in an item slot and the
+    # host aborted the whole ftherlnd with "bad equip".
+    tail = com.get('tail') or b''
+    bad_paths = len(tail) >= 140 and any(tail[130 + i] > 15 for i in range(10))
+    if len(tail) != 181 or bad_paths:
+        print(f'  NOTE: .trn com candidate for uid {uid} is malformed '
+              f'(paths {list(tail[130:140])}); name and equipment not copied')
+        return None
     return com
 
 
+VANILLA_ITEM_MAX = 529   # data/item.trs in a stock Dominions 6 install
+ITEM_MAX_ID = 699        # raised from the loaded mods (#selectitem/#newitem)
+
+# The item slots are u16 LE at the very start of the com tail: 23 slots,
+# slot k at tail + 2k (0..44).  Verified against the engine: injecting id 12
+# at +24 reproduces "bad equip", while tail +46/152/162 are not item slots.
+# tail + 141..148 holds the eight carried gem counts (and +149 the ninth).
+T_ITEMS = 0
+T_ITEMS_END = 46
+
+
+def _item_max_from_mods(mods) -> int:
+    """Largest item id defined by the loaded mods (vanilla floor 529)."""
+    root = Path(__file__).resolve().parent.parent / 'resources' / 'mods'
+    best = VANILLA_ITEM_MAX
+    for mod in mods:
+        p = root / str(mod)
+        if not p.exists():
+            p = root / (str(mod) + '.dm')
+        if not p.exists():
+            continue
+        try:
+            with open(p, encoding='utf-8', errors='ignore') as fh:
+                for line in fh:
+                    s = line.strip()
+                    if s.startswith('#newitem ') or s.startswith('#selectitem '):
+                        try:
+                            best = max(best, int(s.split()[1]))
+                        except (IndexError, ValueError):
+                            pass
+        except OSError:
+            pass
+    return best
+
+
+def _items_of(tail: bytes) -> list[int]:
+    """Item ids held in the com tail's 23 equipment slots (u16 LE)."""
+    if len(tail) < T_ITEMS_END:
+        return []
+    return [struct.unpack_from('<H', tail, o)[0]
+            for o in range(T_ITEMS, T_ITEMS_END, 2)]
+
+
+def _sanitize_items(tail: bytearray, who: str) -> bytearray:
+    """Zero equipment ids the arena's item table does not define.
+
+    A stale .trn/.2h slot can hold an id past the last real item (the host
+    aborts the whole ftherlnd with "bad equip" if one survives).  Ids above
+    ITEM_MAX_ID -- or the 0xFFFF placeholder -- are cleared; legal items,
+    paths, gems and scripts are untouched.
+    """
+    if len(tail) < T_ITEMS_END:
+        return tail
+    cleared = []
+    for off in range(T_ITEMS, T_ITEMS_END, 2):
+        iid = struct.unpack_from('<H', tail, off)[0]
+        if iid and (iid > ITEM_MAX_ID or iid == 0xFFFF):
+            struct.pack_into('<H', tail, off, 0)
+            cleared.append(iid)
+    if cleared:
+        print(f'  dropped invalid item id(s) {cleared} on {who} '
+              f'(arena item table ends at {ITEM_MAX_ID})')
+    return tail
+
+
+def _squad_slots(squads: list[tuple[int, int]]) -> list[int]:
+    """Squad ids laid out in a com record's five slot fields.
+
+    The host treats slot 0 as the commander's bodyguard squad and caps it to
+    the commander's bodyguard limit (5 units for a mounted commander such as
+    the Bird Knight Commander).  A copied 79-unit squad placed there comes
+    out of the first host as one 5-unit squad plus 74 leaderless units.
+    Slot 0 is optional, so it stays empty and the squads go to slots 1..4;
+    only a fifth squad has to use it, and then the smallest one does.
+    """
+    ids = [s for s, _ in sorted(squads, key=lambda kv: kv[1])[:5]]
+    return ids if len(ids) == 5 else [0xFFFFFFFF] + ids
+
+
 def _com_record(comid: int, name: str, uid: int, squads: list[int],
-                tail: bytes) -> bytes:
+                tail: bytes, keep_layout: bool = False) -> bytes:
     """A whole com record: comid, name, unit id, 5 squad slots, tail.
 
     The order byte at ``tail + 140`` is written as 0.  It is a leftover of
@@ -731,11 +839,27 @@ def _com_record(comid: int, name: str, uid: int, squads: list[int],
     commander's carried gem counts (eight bytes, F,A,W,E,S,D,N,B), and an
     earlier u32 clear at +140 silently wiped the fire/air/water gems.
     Items, magic paths, gems and battle scripts are kept as copied.
+
+    ``keep_layout=False`` clears the image's copy of the 29 byte per-squad
+    block at ``tail + 152``.  In ftherlnd that block still describes the
+    *source* province's squads -- including which slot held its bodyguard
+    squad -- and the host re-applies it on init: a copied squad that now
+    sits in a slot the source used for bodyguards is cut down to the
+    bodyguard limit (5 units for a mounted commander), so 18 of Aitareya's
+    23 Bird Knights came out leaderless even though the squad occupied
+    slot 1 with its full size.  The arena is a new map, so the copied
+    layout is meaningless and blanking it lets the host lay the squads out
+    from scratch with their full size.  The orders file copy must keep it
+    (``keep_layout=True``): there the same bytes carry the battle scripts
+    the client and the host read.
     """
     slots = (list(squads) + [0xFFFFFFFF] * 5)[:5]
     body = bytearray(tail)
     if len(body) > T_ORDER:
         body[T_ORDER] = 0
+    if not keep_layout and squads and len(body) >= COM_TAIL:
+        body[T_SQUAD_LAYOUT:COM_TAIL] = bytes(COM_TAIL - T_SQUAD_LAYOUT)
+    _sanitize_items(body, f'com {comid} ({name})')
     return (struct.pack('<I', comid) + _enc(name) + b'\x4f'
             + struct.pack('<I', uid) + struct.pack('<5I', *slots) + bytes(body))
 
@@ -754,16 +878,18 @@ def _write_arena_h2(path: Path, god_name: str, god_uid: int, god_tail: bytes,
     if not path.exists():
         return
     raw = path.read_bytes()
-    god_com = None
-    for uid in range(1, 64):
-        god_com = _trn_commander(raw, uid)
-        if god_com:
-            break
+    god_com = _trn_commander(raw, god_uid) if god_uid else None
+    if god_com is None:
+        for uid in range(1, 64):
+            god_com = _trn_commander(raw, uid)
+            if god_com:
+                break
     if god_com is None:
         print(f'  WARNING: no god com record in {path.name}, orders not written')
         return
-    recs = [_com_record(god_com['comid'], god_name, god_uid, [], god_tail)]
-    recs += [_com_record(comid, name, auid, squads, tail)
+    recs = [_com_record(god_com['comid'], god_name, god_uid, [], god_tail,
+                        keep_layout=True)]
+    recs += [_com_record(comid, name, auid, squads, tail, keep_layout=True)
              for comid, name, auid, squads, tail in commanders]
     raw = raw[:god_com['start']] + b''.join(recs) + raw[god_com['end']:]
     path.write_bytes(savecrc.fix(raw))
@@ -773,56 +899,85 @@ def _write_arena_h2(path: Path, god_name: str, god_uid: int, god_tail: bytes,
 
 def _h2_add_commanders(
         path: Path,
-        commanders: list[tuple[int, str, int, list[int], bytes]]) -> None:
+        commanders: list[tuple[int, str, int, list[int], bytes]],
+        god_unit: int | None = None,
+        god_tail: bytes | None = None) -> None:
     """Append extra commander records behind a side's own god record.
 
     ``_write_arena_h2`` rewrites the whole record of a *transplanted* god.
     A side that keeps its forged arena god does not need that, but the host
     still only lists commanders that have a record in the orders file, so
     the extra com records must be spliced in after the existing god record.
+    ``god_unit`` is the god's unit id in this arena; the forged god is not
+    always one of the first 63 records (the unit table layout varies with the
+    creation's indepstr), so look it up by id first.
+
+    ``god_tail`` replaces the forged god's own tail (equipment, carried gems,
+    magic paths and battle script) when the god came from a battle report.
+    The record is then rewritten in place, with the scripts kept
+    (``keep_layout=True``); the commanders follow it.
     """
-    if not commanders:
+    if not commanders and god_tail is None:
         return
     if not path.exists():
         print(f'  WARNING: {path.name} missing, extra commander orders '
               f'not written')
         return
     raw = path.read_bytes()
-    god_com = None
-    for uid in range(1, 64):
-        god_com = _trn_commander(raw, uid)
-        if god_com:
-            break
+    god_com = _trn_commander(raw, god_unit) if god_unit else None
+    if god_com is None:
+        for uid in range(1, 64):
+            god_com = _trn_commander(raw, uid)
+            if god_com:
+                break
     if god_com is None:
         print(f'  WARNING: no god com record in {path.name}, extra '
               f'commander orders not written')
         return
-    recs = [_com_record(comid, name, auid, squads, tail)
+    recs = [_com_record(comid, name, auid, squads, tail, keep_layout=True)
             for comid, name, auid, squads, tail in commanders]
-    raw = raw[:god_com['end']] + b''.join(recs) + raw[god_com['end']:]
+    if god_tail is not None or (god_unit and god_com['uid'] != god_unit):
+        # The god record keeps the arena's own uid: the client looks the god
+        # up by the unit id ftherlnd uses.  A freshly created arena's orders
+        # file can name the god by its creation-time id (6, ...), which no
+        # longer matches once the copied armies have filled the table, so the
+        # record is rewritten with the current id even when the tail is
+        # unchanged.
+        god_rec = _com_record(
+            god_com['comid'], god_com['name'], god_unit or god_com['uid'], [],
+            god_com['tail'] if god_tail is None else god_tail,
+            keep_layout=True)
+        raw = (raw[:god_com['start']] + god_rec
+               + b''.join(recs) + raw[god_com['end']:])
+    else:
+        raw = raw[:god_com['end']] + b''.join(recs) + raw[god_com['end']:]
     path.write_bytes(savecrc.fix(raw))
-    print(f'  orders file {path.name}: +{len(recs)} extra commander '
-          f'record(s)')
+    print(f'  orders file {path.name}: god'
+          f'{" tail" if god_tail is not None else ""} +{len(recs)} '
+          f'commander record(s)')
 
 
-def _h2_set_god_paths(path: Path, paths: tuple[int, ...]) -> None:
+def _h2_set_god_paths(path: Path, paths: tuple[int, ...],
+                      god_unit: int | None = None) -> None:
     """Rewrite the forged god's magic paths in a side's orders file."""
     if not path.exists():
         return
     raw = path.read_bytes()
-    god_com = None
-    for uid in range(1, 64):
-        god_com = _trn_commander(raw, uid)
-        if god_com:
-            break
+    god_com = _trn_commander(raw, god_unit) if god_unit else None
+    if god_com is None:
+        for uid in range(1, 64):
+            god_com = _trn_commander(raw, uid)
+            if god_com:
+                break
     if god_com is None:
         print(f'  WARNING: no god com record in {path.name}, pretender '
               f'paths not written')
         return
     tail = bytearray(god_com['tail'])
     tail[T_PATHS:T_PATHS + 10] = bytes(paths)
-    rec = _com_record(god_com['comid'], god_com['name'], god_com['uid'],
-                      [], bytes(tail))
+    rec = _com_record(god_com['comid'], god_com['name'],
+                      god_unit or god_com['uid'], [], bytes(tail),
+                      keep_layout=True)
     raw = raw[:god_com['start']] + rec + raw[god_com['end']:]
     path.write_bytes(savecrc.fix(raw))
 
@@ -862,7 +1017,7 @@ def _source_army(save_dir: Path, nation: int, provinces: list[int]
     """
     trn_path, raw = _player_trn(save_dir, nation)
     wanted = set(provinces)
-    comp = [r['type'] for r in trn_parse.unit_records(raw)
+    comp = [r['type'] for r in trn_parse.current_unit_records(raw)
             if r['nation'] == nation and r['province'] in wanted]
     if not comp:
         raise ValueError(_no_army_message(trn_path, save_dir, nation,
@@ -880,7 +1035,7 @@ def _no_army_message(trn_path: Path, save_dir: Path, nation: int,
     """
     raw = trn_path.read_bytes()
     on_map = trn_parse.map_provinces(save_dir)
-    mine = Counter(r['province'] for r in trn_parse.unit_records(raw)
+    mine = Counter(r['province'] for r in trn_parse.current_unit_records(raw)
                    if r['nation'] == nation)
     lines = [f'no units found in {trn_path.name} for provinces {provinces}']
     if on_map:
@@ -913,7 +1068,7 @@ def _province_records(raw: bytes, provinces: list[int],
     the province is no longer part of the army the user sees there.
     """
     wanted = set(provinces)
-    return [r for r in trn_parse.unit_records(raw)
+    return [r for r in trn_parse.current_unit_records(raw)
             if r['nation'] == nation and r['province'] in wanted]
 
 
@@ -944,6 +1099,7 @@ def _army_unitspecs(raw: bytes, records: list[dict]) -> list[dict]:
             'src_uid': r['uid'],
             'master': master,
             'rider': rider,
+            'hp': r['hp'],
         })
     return specs
 
@@ -1647,15 +1803,19 @@ def _player_trn(save_dir: Path, nation: int) -> tuple[Path, bytes]:
     return best_path, best_path.read_bytes()
 
 
-def _vcr_unit_type(raw: bytes, uid: int, lo: int, hi: int) -> int | None:
+def _vcr_unit_type(raw: bytes, uid: int, lo: int, hi: int,
+                   nations: tuple[int, ...] | None = None) -> int | None:
     """Unit type of a battle participant, read from its VCR snapshot record.
 
     A commander of the copied side usually has no record in the player's .trn
-    unit table (only the player's own units and visible enemies are listed),
-    and ``trn_parse._looks_like_record`` rejects the snapshot anyway because
-    its origin field is ``-2``.  The VCR still carries the same 173-byte
-    record, with the uid at ``q + 4``, squad ``-1`` at ``q + 32``, type at
-    ``q + 36`` and province at ``q + 40``.
+    unit table (only the player's own units and visible enemies are listed).
+    The VCR carries its own 173-byte snapshot: uid at ``q``, squad at
+    ``q + 28`` (``-1`` for a commander), type at ``q + 32``, province at
+    ``q + 36`` and nation at ``q + 64``.  These are four bytes earlier than
+    the .trn record layout -- reading ``q + 36`` as the type silently matched
+    province ids and returned None for every commander, which dropped all of
+    them into the "unknown type" spare pool and handed each one a random
+    other commander's com record.
 
     This type is what aligns a VCR com record (name, magic paths, equipment)
     with the right unit slot.
@@ -1663,11 +1823,14 @@ def _vcr_unit_type(raw: bytes, uid: int, lo: int, hi: int) -> int | None:
     pat = struct.pack('<I', uid)
     q = raw.find(pat, lo, hi)
     while q >= 0:
+        if q + 68 > len(raw):
+            return None
         typ = struct.unpack_from('<H', raw, q + 32)[0]
         prov = struct.unpack_from('<H', raw, q + 36)[0]
-        origin = struct.unpack_from('<H', raw, q + 38)[0]
-        if (typ in gamedata.units() and origin == 0xFFFE
+        nat = struct.unpack_from('<H', raw, q + 64)[0]
+        if (typ in gamedata.units()
                 and 1 <= prov <= trn_parse.province_max()
+                and (nations is None or nat in nations)
                 and raw[q + 28:q + 32] == b'\xff\xff\xff\xff'):
             return typ
         q = raw.find(pat, q + 1, hi)
@@ -1675,61 +1838,91 @@ def _vcr_unit_type(raw: bytes, uid: int, lo: int, hi: int) -> int | None:
 
 
 def _battle_com_candidates(raw: bytes, rep: dict) -> list[dict]:
-    """Commander records embedded immediately before a report's BCD block.
+    """Commander records carried in a report's VCR block.
 
     A battle casualty has no 173-byte unit record, but the VCR still carries
     its complete com record (name, squads, orders and equipment) next to the
-    surviving commanders.  Only this local VCR block is considered; the .trn
-    contains many unrelated name/uid byte patterns elsewhere.
-    """
-    start = max(rep['vcr'] + 7, rep['bcd'] - 8192)
-    end = rep['bcd']
-    found: dict[int, dict] = {}
-    for i in range(start, end - 4):
-        if raw[i] != 0x4F:
-            continue
-        uidpos = i + 1
-        uid = struct.unpack_from('<I', raw, uidpos)[0]
-        if not 1 <= uid < 1_000_000:
-            continue
-        slots = struct.unpack_from('<5I', raw, uidpos + 4)
-        if not all(s == 0xFFFFFFFF or s < 10_000_000 for s in slots):
-            continue
-        body_end = uidpos + COM_BODY
-        if body_end > end:
-            continue
+    surviving commanders.  The whole ``[vcr, bcd)`` segment is searched: on a
+    big battle the block is far larger than the 8 KiB window that used to be
+    scanned before the BCD head (province 61: 201 records spread over ~45 KiB),
+    and a narrow window left most commanders without a com record -- the host
+    then treated them as plain soldiers.
 
-        # Find the nearest plausible start of the XOR-encoded name.  In
-        # particular, do not call _trn_commander(uid): that returns the last
-        # record for the uid elsewhere in the .trn and misses this VCR-local
-        # record (which is the one carrying battle-time equipment).
-        name_start = None
-        name = ''
-        for p in range(i - 1, max(start, i - 64), -1):
-            decoded = bytes(b ^ XOR for b in raw[p:i]).decode('latin1')
-            comid = struct.unpack_from('<I', raw, p - 4)[0] if p >= 4 else 0
-            if (len(decoded) >= 2 and decoded[0].isupper()
-                    and decoded[1].islower()
-                    and decoded.isprintable() and comid < 100_000):
-                name_start = p
-                name = decoded
-                break
-        if name_start is None or name_start - 4 < start:
-            continue
-        record_start = name_start - 4
-        tail = raw[uidpos + 24:uidpos + 24 + 181]
-        if len(tail) != 181:
-            continue
-        found[uid] = {
-            'start': record_start,
-            'end': body_end,
-            'comid': struct.unpack_from('<I', raw, record_start)[0],
-            'name': name,
-            'uid': uid,
-            'squads': [s for s in slots if s != 0xFFFFFFFF],
-            'tail': tail,
-            'type': _vcr_unit_type(raw, uid, rep['vcr'], rep['bcd']),
-        }
+    A strict pass accepts only names that look like a word (upper case then
+    lower case).  A few records in a real save carry a placeholder name in
+    lower case ("redmage") or with a space ("sss lock"); a second, relaxed
+    pass fills in the uids still missing, guarded by a valid comid and a
+    well-formed tail (magic paths 0..15) so unrelated text cannot qualify.
+    """
+    start = rep['vcr'] + 7
+    end = rep['bcd']
+    nations = (rep['attacker'], rep['defender'])
+
+    def scan(relaxed: bool) -> dict[int, dict]:
+        found: dict[int, dict] = {}
+        i = raw.find(b'\x4f', start, end - 4)
+        while i >= 0:
+            uidpos = i + 1
+            uid = struct.unpack_from('<I', raw, uidpos)[0]
+            slots = struct.unpack_from('<5I', raw, uidpos + 4)
+            if (1 <= uid < 1_000_000
+                    and all(s == 0xFFFFFFFF or s < 10_000_000
+                            for s in slots)
+                    and uidpos + COM_BODY <= end):
+                # Find the nearest plausible start of the XOR-encoded name.
+                # In particular, do not call _trn_commander(uid): that
+                # returns the last record for the uid elsewhere in the .trn
+                # and misses this VCR-local record (which is the one carrying
+                # battle-time equipment).
+                name_start = None
+                name = ''
+                for p in range(i - 1, max(start, i - 64), -1):
+                    if p < 4:
+                        continue
+                    decoded = bytes(b ^ XOR for b in raw[p:i]).decode('latin1')
+                    comid = struct.unpack_from('<I', raw, p - 4)[0]
+                    if not (len(decoded) >= 2 and decoded.isprintable()
+                            and comid < 100_000):
+                        continue
+                    if relaxed:
+                        # Reject zero padding (0x00 decodes to "O") and the
+                        # 0xFF padding of an unrelated block (0xFF decodes to
+                        # "°"): a real placeholder name is plain ASCII and
+                        # sits behind a non-zero comid.
+                        if (raw[p] == 0 or comid == 0
+                                or not all(32 <= ord(ch) < 127
+                                           for ch in decoded)):
+                            continue
+                    elif not (decoded[0].isupper() and decoded[1].islower()):
+                        continue
+                    name_start = p
+                    name = decoded
+                    break
+                if name_start is not None and name_start - 4 >= start:
+                    record_start = name_start - 4
+                    tail = raw[uidpos + 24:uidpos + 24 + 181]
+                    if len(tail) == 181 and not (
+                            relaxed
+                            and any(tail[130 + k] > 15 for k in range(10))):
+                        found[uid] = {
+                            'start': record_start,
+                            'end': uidpos + COM_BODY,
+                            'comid': struct.unpack_from(
+                                '<I', raw, record_start)[0],
+                            'name': name,
+                            'uid': uid,
+                            'squads': [s for s in slots
+                                       if s != 0xFFFFFFFF],
+                            'tail': tail,
+                            'type': _vcr_unit_type(raw, uid, rep['vcr'],
+                                                   end, nations),
+                        }
+            i = raw.find(b'\x4f', i + 1, end - 4)
+        return found
+
+    found = scan(False)
+    for uid, candidate in scan(True).items():
+        found.setdefault(uid, candidate)
     return sorted(found.values(), key=lambda c: c['start'])
 
 
@@ -1790,6 +1983,12 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
     some reports (for example a defender that held the province) omit that
     side from the BCD block entirely, so visible records are also the fallback
     for an empty BCD side.
+
+    ``timing`` picks which BCD list is copied: ``'before'`` (default) is the
+    army at battle start, ``'after'`` only the units left when the battle
+    ended.  A side whose whole army died has an empty ``'after'`` list, and
+    that is copied as-is -- falling back to the visible records would bring
+    the dead units back.
     """
     if isinstance(entries, dict):  # legacy single-object form
         entries = [entries]
@@ -1845,19 +2044,48 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
                 f'"attacker" or "defender", got {copy!r} '
                 f'({_label(seq, rep)})')
         side_nat = rep[copy]
-        army = rep['start'][side_nat]
+        phase = br.get('timing', 'before')
+        if isinstance(phase, dict):        # per nation, as _pick_battle_reports
+            phase = phase.get(side_nat, 'before')
+        if phase not in ('before', 'after'):
+            raise ValueError(
+                f'battle report at province {prov}: "timing" must be '
+                f'"before" or "after", got {phase!r}')
+        army = rep['end' if phase == 'after' else 'start'][side_nat]
+        # Distinguishes "the BCD block lists no such side at all" (fall back to
+        # the visible records) from "every unit of that side died" (copy
+        # nothing when the survivors are wanted).
+        has_bcd = bool(rep['start'][side_nat] or rep['end'][side_nat])
         side_records = [r for r in trn_parse.unit_records(raw)
                         if r['province'] == prov and r['nation'] == side_nat]
+        cmdr_table = rep['end_commanders' if phase == 'after'
+                          else 'start_commanders']
         if army:
             picked_units = []
             by_type: dict[int, list[dict]] = {}
             for record in side_records:
                 by_type.setdefault(record['type'], []).append(record)
 
-            def_cmdrs = sum(rep['start_commanders'][rep['defender']].values())
-            side_cmdrs = sum(rep['start_commanders'][side_nat].values())
-            first = 0 if side_nat == rep['defender'] else def_cmdrs
-            candidates = _battle_com_candidates(raw, rep)[first:first + side_cmdrs]
+            # Select the com records by the SIDE each belongs to, read from the
+            # VCR snapshot (uid -> nation), never by a positional slice.  The
+            # candidate list is ordered by byte position, which is
+            # attacker-first in this save, so the old "defender-first" offset
+            # grabbed the other side's commanders -- that is exactly why
+            # Meliath (the attacker's commander) got no com at all.
+            side_uids = set(_scan_vcr_snapshots(raw, rep['vcr'], rep['bcd'],
+                                                side_nat))
+            candidates = [c for c in _battle_com_candidates(raw, rep)
+                          if c['uid'] in side_uids]
+            if not candidates:
+                # No usable snapshot block: keep the old positional split so
+                # behaviour is unchanged for older reports.
+                def_cmdrs = sum(
+                    cmdr_table[rep['defender']].values())
+                side_cmdrs = sum(
+                    cmdr_table[side_nat].values())
+                first = 0 if side_nat == rep['defender'] else def_cmdrs
+                candidates = _battle_com_candidates(
+                    raw, rep)[first:first + side_cmdrs]
 
             # A com record is aligned to a unit slot by unit TYPE, read from
             # the VCR snapshot of that uid.  "No unit record in this province"
@@ -1872,7 +2100,7 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
             for c in candidates:
                 if c['uid'] not in used_uids:
                     spare_by_type.setdefault(c.get('type'), []).append(c)
-            commander_types = rep['start_commanders'][side_nat]
+            commander_types = cmdr_table[side_nat]
 
             segment = raw[rep['vcr']:rep['bcd']]
             # VCR snapshot block: uid → {type, squad, province} for EVERY
@@ -1890,8 +2118,16 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
             for t, count in army.items():
                 picked_units += [t] * count
                 candidates_for_type = by_type.get(t, [])
-                mentioned = [r for r in candidates_for_type
-                             if struct.pack('<I', r['uid']) in segment]
+                if side == 'own' and vcr_snaps:
+                    # Every own unit is visible, but the raw byte search can
+                    # also match a uid that merely occurs elsewhere in the
+                    # segment.  Trust the snapshot set so the exact unit that
+                    # fought (e.g. "Meliath") is picked, not a same-type one.
+                    mentioned = [r for r in candidates_for_type
+                                 if r['uid'] in vcr_snaps]
+                else:
+                    mentioned = [r for r in candidates_for_type
+                                 if struct.pack('<I', r['uid']) in segment]
                 visible = mentioned or candidates_for_type
                 picked = visible[:count]
                 detailed += picked
@@ -1899,6 +2135,26 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
                     vcr_used.add(r['uid'])
                 missing = count - len(picked)
                 for _ in range(missing):
+                    # Troops, and own-side commanders, are filled from the VCR
+                    # snapshot block first: the snapshot carries the exact uid
+                    # that fought, so a commander keeps its own com record
+                    # (name, equipment, script) instead of a same-type one.
+                    # A common commander type (e.g. Fortune Teller) has many
+                    # instances, and type-only pairing attached "Meliath"'s com
+                    # to a different slot once the province's own records were
+                    # no longer copied.  Enemy commanders keep the spare-com
+                    # path: they are not visible in the .trn, so the VCR com
+                    # block is their only source.
+                    pool = [u for u in vcr_by_type.get(t, [])
+                            if u not in vcr_used]
+                    if pool and (t not in commander_types or side == 'own'):
+                        uid = pool.pop(0)
+                        vcr_used.add(uid)
+                        detailed.append({
+                            'uid': uid, 'type': t, 'province': prov,
+                            'nation': side_nat, 'pos': None,
+                            'hp': vcr_snaps[uid]['hp']})
+                        continue
                     if t in commander_types:
                         com = _take_spare_commander(spare_by_type, t)
                         if com is None:
@@ -1914,20 +2170,14 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
                             'nation': side_nat, 'pos': None, 'com': com})
                         vcr_used.add(com['uid'])
                     else:
-                        # Troop slot missing from .trn: try to pull a uid
-                        # from the VCR snapshot block so this unit is not
-                        # an anonymous None that later falls out of every
-                        # squad assignment.
-                        pool = [u for u in vcr_by_type.get(t, [])
-                                if u not in vcr_used]
-                        if pool:
-                            uid = pool.pop(0)
-                            vcr_used.add(uid)
-                            detailed.append({
-                                'uid': uid, 'type': t, 'province': prov,
-                                'nation': side_nat, 'pos': None})
-                        else:
-                            detailed.append(None)
+                        detailed.append(None)
+        elif phase == 'after' and has_bcd:
+            # The side fought but has no survivors: copying the visible
+            # records here would reintroduce units the battle killed.
+            picked_units = []
+            print(f'  {side} battle report {prov} [{_label(seq, rep)}]: '
+                  f'no {copy} {_nation_text(side_nat)} unit survived the '
+                  f'battle, nothing copied')
         else:
             picked_units = [r['type'] for r in side_records]
             detailed += side_records
@@ -1937,8 +2187,53 @@ def _report_details(raw: bytes, entries, side: str) -> tuple[list[int], list[dic
         for i, record in enumerate(detailed):
             if record and record['uid'] in local_com:
                 detailed[i] = {**record, 'com': local_com[record['uid']]}
+        if army and phase == 'before':
+            # Formation completeness.  The BCD start list can omit a squad
+            # leader (its count byte is 0 there even though its squad fought),
+            # so the copied troops keep a squad id that no copied commander
+            # claims -- the host then leaves them outside any formation.  The
+            # VCR com records still name the leader of every squad, so add the
+            # leaders of copied squads that the start list does not contain.
+            need = set()
+            for r in detailed:
+                if not r:
+                    continue
+                sq = None
+                if r['pos'] is not None:
+                    sq = struct.unpack_from('<I', raw, r['pos'] + 32)[0]
+                elif r['uid'] in vcr_snaps:
+                    sq = vcr_snaps[r['uid']]['squad']
+                if sq is not None and sq != 0xFFFFFFFF:
+                    need.add(sq)
+            led = set()
+            for r in detailed:
+                if r and r.get('com'):
+                    led.update(r['com']['squads'])
+            copied_uids = {r['uid'] for r in detailed if r}
+            added = []
+            for c in candidates:
+                if not need - led:
+                    break
+                if (c['type'] is None or c['uid'] in copied_uids
+                        or not (set(c['squads']) & need)):
+                    continue
+                picked_units.append(c['type'])
+                detailed.append({'uid': c['uid'], 'type': c['type'],
+                                 'province': prov, 'nation': side_nat,
+                                 'pos': None, 'com': c,
+                                 'hp': vcr_snaps.get(c['uid'], {}).get('hp')})
+                copied_uids.add(c['uid'])
+                led.update(c['squads'])
+                added.append(f'{c["name"]} ({gamedata.units()[c["type"]].name})')
+            if added:
+                print(f'  NOTE: {len(added)} squad leader(s) missing from the '
+                      f'battle start list but named by the VCR were added so '
+                      f'their squads keep their formation: '
+                      f'{"; ".join(added)}')
         print(f'  {side} battle report {prov} [{_label(seq, rep)}], copying '
-              f'{copy} {_nation_text(side_nat)}: {len(picked_units)} units '
+              f'{copy} {_nation_text(side_nat)} '
+              f'({"before" if phase == "before" else "after"} battle): '
+              f'{len(picked_units)} units '
               f'({sorted(set(picked_units))})')
         units += picked_units
     return units, detailed
@@ -1960,8 +2255,8 @@ def _scan_vcr_snapshots(raw: bytes, vcr_start: int, bcd_start: int,
     see, so the VCR is the *only* source for squad ids and uid/type pairs
     of unseen enemy units.
 
-    Returns ``{uid: {'type': int, 'squad': int, 'province': int}}`` for
-    every snapshot matching ``nation``.
+    Returns ``{uid: {'type': int, 'squad': int, 'province': int, 'hp': int}}``
+    for every snapshot matching ``nation``.
     """
     out: dict[int, dict] = {}
     seg = raw[vcr_start:bcd_start]
@@ -1980,7 +2275,8 @@ def _scan_vcr_snapshots(raw: bytes, vcr_start: int, bcd_start: int,
         if (typ in gamedata.units()
                 and 1 <= prov <= 5000
                 and nat == nation):
-            out[uid] = {'type': typ, 'squad': sq, 'province': prov}
+            out[uid] = {'type': typ, 'squad': sq, 'province': prov,
+                        'hp': struct.unpack_from('<H', seg, pos + 34)[0]}
         pos += 1
     return out
 
@@ -2013,7 +2309,47 @@ def _report_units(raw: bytes, entries, side: str) -> list[int]:
     return _report_details(raw, entries, side)[0]
 
 
-def _pick_battle_reports(raw: bytes, provs) -> list[dict]:
+def _split_report_entries(picks: list[dict], own_nation: int
+                          ) -> tuple[list[dict], list[dict], set[int]]:
+    """Split picks into ``(player_entries, enemy_entries, skipped_provinces)``.
+
+    The rule is per read side, not per province list.  A commander must never
+    be copied into both armies (the engine rejects that with "twin
+    commanders"):
+
+    * a read side whose nation is the own nation goes to the player army, and
+      that province is skipped from the player's current-garrison copy;
+    * a read side whose nation is not the own nation goes to the enemy army,
+      and that province is skipped from the enemy scout copy (the enemy side
+      derives its skip set from the returned enemy entries' provinces).
+
+    ``'both'`` reads the own side and the other side, so it applies both
+    rules.  A province in both lists whose pick reads only one side keeps the
+    other side's current copy (an enemy-occupied province with our troops in
+    the castle: read the enemy -> only the scout is suppressed, the own
+    garrison stays).
+    """
+    player_entries: list[dict] = []
+    enemy_entries: list[dict] = []
+    skipped: set[int] = set()
+    for pick in picks:
+        prov = int(pick['province'])
+        sides = ([pick['own_side'], pick['other_side']]
+                 if pick['copy'] == 'both' else [pick['copy']])
+        for side in sides:
+            nation = pick['attacker'] if side == 'attacker' else pick['defender']
+            entry = {**pick, 'copy': side,
+                     'timing': pick.get('timing', {}).get(nation, 'before')}
+            if nation == own_nation:
+                player_entries.append(entry)
+                skipped.add(prov)
+            else:
+                enemy_entries.append(entry)
+    return player_entries, enemy_entries, skipped
+
+
+def _pick_battle_reports(raw: bytes, provs,
+                         own_nation: int | None = None) -> list[dict]:
     """Interactively pick one battle report per scout province.
 
     Every battle report whose province is listed in ``enemy.provinces``
@@ -2032,6 +2368,13 @@ def _pick_battle_reports(raw: bytes, provs) -> list[dict]:
     ``copy`` keys for ``_report_details``, plus ``seq`` (the report's 0-based
     index at that province) so a province with several battles between the
     same nations still resolves to exactly the picked report.
+
+    ``own_nation`` enables the second-level "copy both sides" choice: it
+    matches that nation id against the report's attacker/defender and stores
+    ``copy='both'`` with ``own_side``/``other_side``.  When neither side is the
+    own nation the choice is refused and the second level is shown again.  The
+    caller expands a ``'both'`` pick into its two concrete sides before
+    ``_report_details`` (which only accepts attacker/defender).
     """
     picked: list[dict] = []
 
@@ -2040,6 +2383,37 @@ def _pick_battle_reports(raw: bytes, provs) -> list[dict]:
         if nat:
             return nat.name
         return 'Independents' if nation == 0 else str(nation)
+
+    def _ask(prompt: str = '> ') -> str | None:
+        """``input`` that returns None at end of input instead of raising.
+
+        The build is also driven with piped input (automation, tests); running
+        out of lines must not end in an EOFError traceback.
+        """
+        try:
+            return input(prompt)
+        except EOFError:
+            print()
+            return None
+
+    def _ask_timing(nation: int) -> str:
+        """Ask whether the copied army is the battle start or the survivors."""
+        while True:
+            print(f"you want to copy '{_nat_name(nation)}'")
+            print('0 copy units before battle')
+            print('1 copy units after battle')
+            line = _ask()
+            if line is None:
+                return 'before'
+            try:
+                n = int(line.strip())
+            except ValueError:
+                n = -1
+            if n == 0:
+                return 'before'
+            if n == 1:
+                return 'after'
+            print('input error')
 
     for prov in provs:
         prov = int(prov)
@@ -2056,12 +2430,16 @@ def _pick_battle_reports(raw: bytes, provs) -> list[dict]:
         while True:
             print(f"There are battles in province: '{prov}', "
                   f'do you want to:')
-            print('0 skip copy battle report')
+            print('0 skip copy battle report  usually you may skip  '
+                  'assasination')
             for seq, name, uuid, att_name, def_name, _, _ in battles:
                 print(f'{seq} copy {name} '
                       f'attacker: {att_name} VS defender: {def_name}')
+            line = _ask()
+            if line is None:          # end of input: copy no more reports
+                return picked
             try:
-                n = int(input('> ').strip())
+                n = int(line.strip())
             except ValueError:
                 n = -1
             if n == 0:
@@ -2074,15 +2452,47 @@ def _pick_battle_reports(raw: bytes, provs) -> list[dict]:
             while True:
                 print('1 copy attacker')
                 print('2 copy defender')
-                side_input = input('> ').strip()
+                print('3 copy both sides (match own nation)')
+                side_line = _ask()
+                if side_line is None:     # end of input: stop asking
+                    return picked
+                side_input = side_line.strip()
                 if side_input in ('1', '2'):
+                    side = 'attacker' if side_input == '1' else 'defender'
+                    nation = rep[side]
+                    picked.append({
+                        'province': prov, 'attacker': rep['attacker'],
+                        'defender': rep['defender'],
+                        'copy': side,
+                        'seq': rep_index,
+                        'timing': {nation: _ask_timing(nation)}})
+                    break
+                if side_input == '3':
+                    if own_nation is None:
+                        print('  own nation id is unknown, cannot match; '
+                              'choose 1 or 2')
+                        continue
+                    if rep['attacker'] == own_nation:
+                        own_side, other_side = 'attacker', 'defender'
+                    elif rep['defender'] == own_nation:
+                        own_side, other_side = 'defender', 'attacker'
+                    else:
+                        print(f'  没有匹配到己方 (own nation {own_nation}); '
+                              f'attacker {rep["attacker"]} '
+                              f'({_nat_name(rep["attacker"])}), defender '
+                              f'{rep["defender"]} '
+                              f'({_nat_name(rep["defender"])}) -- choose again')
+                        continue
+                    # Both sides are copied, so both are asked separately.
+                    timing = {rep['attacker']: _ask_timing(rep['attacker'])}
+                    timing[rep['defender']] = _ask_timing(rep['defender'])
+                    picked.append({
+                        'province': prov, 'attacker': rep['attacker'],
+                        'defender': rep['defender'], 'copy': 'both',
+                        'own_side': own_side, 'other_side': other_side,
+                        'seq': rep_index, 'timing': timing})
                     break
                 print('input error')
-            picked.append({'province': prov, 'attacker': rep['attacker'],
-                           'defender': rep['defender'],
-                           'copy': 'attacker' if side_input == '1'
-                           else 'defender',
-                           'seq': rep_index})
             break
     return picked
 
@@ -2161,7 +2571,7 @@ def _visible_enemy_units(raw: bytes, province: int,
         return [], 0
     units = gamedata.units()
     picked: list[dict] = []
-    for record in trn_parse.unit_records(raw):
+    for record in trn_parse.current_unit_records(raw):
         if record['province'] != province or record['nation'] != nation:
             continue
         if record['type'] not in units:
@@ -2503,6 +2913,13 @@ def _scrub_commanders(raw: bytearray, base: int, stride: int, count: int,
             max_comid = max(max_comid, comid)
         if unitid in targets:
             struct.pack_into('<i', raw, uidpos, -1)
+            # The dead slot keeps the old commander's tail, including item
+            # slots that may hold stale ids past the item table -- the host
+            # validates every record in the chain and aborts with
+            # "bad equip" even for this dead one.
+            _dead = bytearray(raw[uidpos + 24:rec_end])
+            _sanitize_items(_dead, f'scrubbed com {comid}')
+            raw[uidpos + 24:rec_end] = _dead
             # A dead slot (comid -1) stays dead: handing its comid out to a
             # transplanted commander makes the host abort (observed: Afe
             # received comid 4294967295 and hosting failed).  Only live
@@ -2708,6 +3125,19 @@ def _write_nation_army(raw: bytearray, base: int, stride: int, count: int,
     # Write types and provinces.
     for off, spec in zip(slots, specs):
         struct.pack_into('<H', raw, off + 32, spec['type'])
+
+    # Current hit points (+34).  A slot is usually borrowed from the arena's
+    # old garrison, which leaves its own hp behind: 178 of the copied records
+    # carried hp 14 and the host recycled every one of them at init ("removed
+    # ... hp 0"), silently dropping 88 Sage-Priests, 22 troops and a dozen
+    # commanders.  Write the hp read from the unit's source record instead.
+    for off, spec in zip(slots, specs):
+        hp = spec.get('hp')
+        if hp is None:
+            unit = gamedata.units().get(spec['type'])
+            hp = unit.hp if unit else 0
+        if hp:
+            struct.pack_into('<H', raw, off + 34, hp)
     for off in [god_off] + slots:
         struct.pack_into('<HH', raw, off + 36, province, province)
 
@@ -2900,6 +3330,8 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     provinces = [int(p) for p in player_cfg['provinces']]
     enemy_cfg = cfg.get('enemy') or {}
     mods = cfg.get('mods') or []
+    global ITEM_MAX_ID
+    ITEM_MAX_ID = _item_max_from_mods(mods)
 
     save_dir = _source_dir(arena)
     # Province ids are bounded by the source map, not by a guess: a 300
@@ -2925,39 +3357,62 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     h2_path = trn_path.with_suffix('.2h')
     h2_raw = h2_path.read_bytes() if h2_path.exists() else None
 
-    # The .trn is the authoritative view of the army: it is the complete
-    # engine-written snapshot of the turn.  The .2h never *adds* units to it
-    # (recruits exist only there), but it does tell which .trn records are
-    # still part of the army; see the filter below.
-    src_units: list[dict] = _province_records(src_raw, provinces,
+    # Battle reports are picked interactively ONCE per province, over the
+    # union of both province lists: a province listed by both sides must not
+    # ask twice, and its pick must feed each army at most once.  The picks are
+    # cached on the config dicts so the arena recreation retries of main() do
+    # not ask again.  A picked province is not copied from its current
+    # garrison/scout state.
+    enemy_provs = enemy_cfg.get('provinces') or []
+    if isinstance(enemy_provs, int):
+        enemy_provs = [enemy_provs]
+    all_provs = list(dict.fromkeys([int(p) for p in list(provinces)
+                                    + list(enemy_provs)]))
+    picks = player_cfg.get('_battle_report_picks')
+    if picks is None:
+        picks = _pick_battle_reports(trn_raw, all_provs,
+                                     own_nation=source_nation)
+        player_cfg['_battle_report_picks'] = picks
+    (player_report_entries, enemy_report_entries,
+     player_report_provs) = _split_report_entries(picks, source_nation)
+    enemy_cfg['_battle_report_picks'] = enemy_report_entries
+    province_copy = [p for p in provinces if p not in player_report_provs]
+
+    # The .trn is the authoritative view of the player's army.  Copy exactly
+    # the records standing in the requested provinces.
+    src_units: list[dict] = _province_records(src_raw, province_copy,
                                               source_nation)
-    # The .trn keeps units that are gone: province 161 still lists the 20
-    # Barbarians that fell this turn (their +66 marker is -1).  The .2h is the
-    # current state of the army and no longer lists them, so a .trn record
-    # absent from the .2h unit table is not copied.  A commander is the
-    # exception: a marching commander can be missing from the .2h unit records
-    # while its com record is still there, so it stays.
-    if h2_raw is not None:
-        h2_uids = {r['uid'] for r in trn_parse.unit_records(h2_raw)}
-        if h2_uids:
-            before = len(src_units)
-            src_units = [r for r in src_units
-                         if r['uid'] in h2_uids
-                         or _trn_commander(h2_raw, r['uid']) is not None]
-            if len(src_units) < before:
-                print(f'  skipped {before - len(src_units)} unit(s) that '
-                      f'{h2_path.name} no longer lists (fallen or gone)')
+    units_raw = src_raw
+    print(f'  unit source: {trn_path.name} '
+          f'({len(src_units)} unit(s) of nation {source_nation} '
+          f'in {province_copy})')
     # Debug mod units are never copied: a copied capital would otherwise
     # bring the pregame grant (46/9001/9002 and their mounts) along.
     n_before = len(src_units)
-    src_units = _without_debug(src_raw, src_units)
+    src_units = _without_debug(units_raw, src_units)
     if len(src_units) < n_before:
         print(f'  excluded {n_before - len(src_units)} debug mod unit(s) '
               f'from the copied army')
-    # Build write-specs from the source .trn so we preserve commander chains
+    # A mount points at its rider's source uid (record +85).  If the rider is
+    # not part of the copied set -- it fell this turn, it is another nation's
+    # unit, or it is the pretender record handled separately -- the engine
+    # aborts with "getfather: bad <uid>".  Drop only those orphan mounts; the
+    # province's real units are still copied as-is.
+    uids = {r['uid'] for r in src_units}
+    kept = []
+    for r in src_units:
+        master = struct.unpack_from('<i', units_raw, r['pos'] + 85)[0]
+        if master > 0 and master not in uids:
+            continue
+        kept.append(r)
+    if len(kept) < len(src_units):
+        print(f'  dropped {len(src_units) - len(kept)} orphan mount(s) '
+              f'whose rider is not in the copied army')
+    src_units = kept
+    # Build write-specs from the source file so we preserve commander chains
     # (master=-2 for commanders, rider bit, mount→rider uid links).  Plain
     # ints lose this information — every rider would flatten to a soldier.
-    src_specs = _army_unitspecs(src_raw, src_units)
+    src_specs = _army_unitspecs(units_raw, src_units)
     src_types = [s['type'] for s in src_specs]
     src_rec = _design_for(src_raw, source_nation)
     src_name = src_rec['god']
@@ -2972,6 +3427,11 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     report_types = _report_units(trn_raw, player_cfg.get('battle_report') or [],
                                  'own')
     src_specs += [{'type': t} for t in report_types]
+
+    # The player-side battle-report entries were split out above (a province in
+    # both lists keeps its current garrison, so it is not listed here).  Their
+    # units are appended to src_specs later, once the pretender chassis is
+    # known, so the pretender itself is not duplicated as a soldier.
 
     # ---- enemy nation ----------------------------------------------------
     enemy_nation = _select_enemy_nation(
@@ -3207,17 +3667,39 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # Qinglong in 199, the garrison in 214).  Its own record is the god
     # record, so it replaces the chassis there instead of being counted
     # as an extra unit of the garrison.
-    # Chassis comes from the orders file when it knows the god's unit
-    # record, else from the .trn.  Both lookups are restricted to the
-    # nation's pretender list (Dom6 Inspector's pretender_types_by_nation):
-    # the name+uid hit alone also matches ordinary commanders and would
-    # put one into the god slot ("king is no god").
+    #
+    # Pretender source priority: player.pretender config > battle report >
+    # own save (.trn/.2h).  The battle report is read first because it also
+    # remembers a god that died in the battle: its chassis stands in the
+    # report's start-of-battle list and its VCR com record still carries
+    # equipment, carried gems, magic paths and the battle script, while the
+    # .trn has no record for a dead unit at all.
     own_chassis = gamedata.pretenders().get(own_nation, set())
-    god_type = ((trn_parse.pretender_type(h2_raw, src_name, chassis=own_chassis)
-                 if h2_raw else None)
-                or trn_parse.pretender_type(src_raw, src_name,
-                                            chassis=own_chassis))
-    src_god_type = god_type  # remember for player.pretender override logic
+    player_report_units, player_report_detail = _report_details(
+        trn_raw, player_report_entries, 'own')
+    save_god_type = ((trn_parse.pretender_type(h2_raw, src_name,
+                                               chassis=own_chassis)
+                      if h2_raw else None)
+                     or trn_parse.pretender_type(src_raw, src_name,
+                                                 chassis=own_chassis))
+    player_report_god = next((d for d in player_report_detail
+                              if d and d['type'] in own_chassis), None)
+    src_god_type = (player_report_god['type']
+                    if player_report_god is not None else save_god_type)
+    god_type = src_god_type
+    player_god_com: dict | None = None
+    if player_report_god is not None:
+        player_god_com = player_report_god.get('com')
+        _unit = gamedata.units().get(src_god_type)
+        print(f'  player pretender from battle report: {src_god_type} '
+              f'({_unit.name if _unit else "?"}) '
+              f'uid {player_report_god["uid"]}'
+              + ('' if player_god_com else ' -- no com record in the report,'
+                 ' equipment and gems unavailable'))
+    elif save_god_type is not None:
+        _unit = gamedata.units().get(save_god_type)
+        print(f'  player pretender chassis from source save: {save_god_type} '
+              f'({_unit.name if _unit else "?"})')
 
     # --- player.pretender override ---------------------------------------
     # If the config supplies a pretender spec (chassis + optional magic
@@ -3256,14 +3738,34 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
 
     src_god_rec: dict | None = None
     if src_god_type is not None:
-        # Which record is the pretender, though?  A same-type unit may
-        # stand in the copied province while the god itself stands
-        # elsewhere (Abysia's Slayer Sanguine garrison and a Slayer
-        # Sanguine pretender share type 1967).  The pretender's com/name
-        # record carries its own unit id, so only that record becomes the
-        # arena god record; every other record stays a real unit.
-        src_god_uid = _pretender_uid(src_raw, src_name,
-                                    {r['uid'] for r in src_units})
+        god_source = src_units
+        if player_report_god is not None:
+            # The god fought in a province whose army comes from a battle
+            # report.  Its uid and, when it survived, its record come from
+            # the report's start-of-battle snapshot; a god that died has no
+            # .trn record at all, so there is nothing to transplant (the
+            # report's com record still supplies its equipment and gems).
+            src_god_uid = player_report_god.get('uid')
+            if player_report_god.get('pos') is not None:
+                src_god_rec = player_report_god
+        else:
+            # Which record is the pretender, though?  A same-type unit may
+            # stand in the copied province while the god itself stands
+            # elsewhere (Abysia's Slayer Sanguine garrison and a Slayer
+            # Sanguine pretender share type 1967).  The pretender's com/name
+            # record carries its own unit id, so only that record becomes the
+            # arena god record; every other record stays a real unit.
+            src_god_uid = _pretender_uid(units_raw, src_name,
+                                        {r['uid'] for r in src_units})
+            if src_god_uid is None and player_report_provs:
+                # The pretender may stand in a province whose army is read
+                # from a battle report, so it is not part of src_units.  Look
+                # across all configured player provinces so the arena god
+                # still gets its .trn record (equipment, magic paths).
+                god_source = _province_records(units_raw, provinces,
+                                               source_nation)
+                src_god_uid = _pretender_uid(
+                    units_raw, src_name, {r['uid'] for r in god_source})
         if player_override_chassis:
             # Chassis changed — the source god is no longer the arena god,
             # so its record stays as a plain unit (no drop needed, no
@@ -3287,9 +3789,12 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                 src_specs = [s for s in src_specs if s.get('src_uid') != drop['uid']]
                 src_units.remove(drop)
                 player_extra_start -= 1
-            god_unit = gamedata.units().get(god_type)
-            print(f'  pretender chassis from source .trn: {god_type} '
-                  f'({god_unit.name if god_unit else "?"})')
+            elif (src_god_rec is None and src_god_uid is not None
+                  and god_source is not src_units):
+                # The god's province is battle-report sourced, so its record
+                # is outside src_units; still transplant the .trn record.
+                src_god_rec = next(
+                    (r for r in god_source if r['uid'] == src_god_uid), None)
 
     enemy_pretender = enemy_cfg.get('pretender')
     enemy_god_paths: tuple[int, ...] | None = None
@@ -3303,12 +3808,22 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         enemy_pretender_id = enemy_pretender
     if enemy_god_paths is not None and not enemy_pretender_id:
         raise ValueError('enemy.pretender magic_paths requires an id')
+    enemy_paths_from_config = enemy_god_paths is not None
 
-    # Enemy god chassis: explicit enemy.pretender config wins; otherwise a
-    # chassis the scout report sighted in the enemy army is that nation's only
-    # god, so it becomes the arena enemy pretender instead of a soldier.
-    reported_god = None
-    if not enemy_pretender_id and enemy_scout_god:
+    # Pretender source priority: enemy.pretender config > battle report >
+    # scout report.  A chassis in the copied side's start-of-battle list is
+    # that nation's only god; unlike a scout sighting, the report also holds
+    # the god's com record (equipment, carried gems, magic paths and battle
+    # script), so it is preferred over the scout report.
+    enemy_report_god = next(
+        (d for d in enemy_report_records
+         if d and d['type'] in gamedata.pretender_chassis()), None)
+    enemy_god_com: dict | None = None
+    reported_god = None            # scout report sighting
+    if not enemy_pretender_id and enemy_report_god is not None:
+        enemy_pretender_id = enemy_report_god['type']
+        enemy_god_com = enemy_report_god.get('com')
+    elif not enemy_pretender_id and enemy_scout_god:
         reported_god = int(enemy_scout_god['id'])
         enemy_pretender_id = reported_god
     if enemy_pretender_id:
@@ -3321,7 +3836,16 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                 f'enemy.pretender {label} is not a pretender chassis; '
                 'the engine removes non-god-class units swapped into the '
                 'god slot')
-        if reported_god is not None:
+        if enemy_god_com is not None:
+            # The report's com record dictates how the god actually spent
+            # its paths and what it carried, so the tail is copied whole
+            # instead of the chassis defaults.
+            enemy_god_paths = tuple(
+                enemy_god_com['tail'][T_PATHS:T_PATHS + 10])
+            print(f'  enemy pretender from battle report: {label} '
+                  f'uid {enemy_report_god["uid"]}; equipment, gems, magic '
+                  f'paths {_path_text(enemy_god_paths)} and script copied')
+        elif reported_god is not None:
             # A sighting shows the chassis, never how its god spent the
             # paths, so the chassis' own defaults from units.csv are used.
             enemy_god_paths = unit.paths
@@ -3334,7 +3858,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                       f'pretender name')
         # Full design swap when source save exposes this nation's design and
         # the user did NOT provide explicit magic_paths (use native paths).
-        if enemy_rec and enemy_god_paths is None:
+        if enemy_rec and not enemy_paths_from_config:
             swap[enemy_nation.id] = src_raw[enemy_rec['pos']:enemy_rec['end']]
             patch_design.pop(enemy_nation.id, None)
             names.append((enemy_nation.id, enemy_rec['god']))
@@ -3357,9 +3881,30 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     if enemy_god_type is not None and enemy_god_type in enemy_comp:
         # Only meaningful when enemy_god_type comes from battle-report input
         # (not from config — extra_units can't hold a pretender chassis).
-        enemy_god_index = enemy_comp.index(enemy_god_type)
-        enemy_comp.remove(enemy_god_type)
+        # Use the report's own slot index: a same-type unit may stand in
+        # front of the god, and removing by type alone would take that one.
+        enemy_god_index = (enemy_report_god['comp_index']
+                           if enemy_report_god is not None
+                           else enemy_comp.index(enemy_god_type))
+        enemy_comp.pop(enemy_god_index)
         enemy_specs.pop(enemy_god_index)
+
+    # Battle-report units must carry their own current hp: the record they
+    # land on is borrowed from the arena's old garrison and keeps that
+    # garrison unit's hp, and the host recycles (deletes) a unit whose hp
+    # happens to be the poison value -- 88 of 127 copied Sage-Priests vanished
+    # that way.  ``comp_index`` points into the pre-removal army, so shift it
+    # when the god was taken out in front of the entry.
+    for rec in enemy_report_records:
+        idx = rec['comp_index']
+        if enemy_god_index is not None:
+            if idx == enemy_god_index:
+                continue
+            if idx > enemy_god_index:
+                idx -= 1
+        hp = rec.get('hp')
+        if hp and 0 <= idx < len(enemy_specs):
+            enemy_specs[idx]['hp'] = hp
 
     if enemy_god_type is not None and any(
             spec['id'] == enemy_god_type for spec in enemy_extra_specs):
@@ -3390,6 +3935,35 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                        for o in keep_offs})
         print(f'  keeping {len(keep_offs)} unit record(s) untouched '
               f'(types {kept})')
+
+    # Append the player's own-side battle-report units now that the pretender
+    # chassis is known.  Only the pretender itself is skipped (it becomes the
+    # arena god, with its .trn record transplanted) -- every other chassis
+    # type is kept as a soldier, exactly like the enemy side.  The list is
+    # the report's start-of-battle composition, so units that died in the
+    # battle are part of it too.
+    player_report_records: list[dict] = []
+    player_report_count = 0
+    for unit_type, detail in zip(player_report_units, player_report_detail):
+        if unit_type == god_type and not player_override_chassis:
+            continue
+        local_index = player_report_count
+        src_specs.append({'type': unit_type, 'hp': (detail or {}).get('hp')})
+        player_report_count += 1
+        if detail is not None:
+            player_report_records.append({**detail, 'report_index': local_index})
+    player_report_expected_cmdrs = sum(
+        1 for r in player_report_records
+        if r.get('com') is not None
+        or _trn_commander(trn_raw, r['uid']) is not None)
+    if player_report_count:
+        counts: dict[int, int] = {}
+        for t in player_report_units:
+            if t == god_type and not player_override_chassis:
+                continue
+            counts[t] = counts.get(t, 0) + 1
+        print(f'  player battle report: {player_report_count} unit(s) '
+              f'{sorted(counts.items())}')
 
     # The unit table must hold both full armies, both god records and the
     # kept debug grant.  Its size is fixed at creation (the random
@@ -3458,7 +4032,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # everything else the chassis carries).  Only the identity and links the
     # arena needs stay local.
     if not player_pretender and src_god_rec is not None:
-        _copy_god_record(raw, p_god, src_raw, src_god_rec,
+        _copy_god_record(raw, p_god, units_raw, src_god_rec,
                          player_prov, own_nation)
         print(f'  player pretender record copied from source save '
               f'(uid {src_god_rec["uid"]})')
@@ -3530,22 +4104,24 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     enemy_expected_cmdrs = sum(
         1 for r in enemy_report_records
         if r['comp_index'] != enemy_god_index
-        and _trn_commander(trn_raw, r['uid']) is not None)
+        and (r.get('com') is not None
+             or _trn_commander(trn_raw, r['uid']) is not None))
     scrubbed = _scrub_commanders(
         raw, base, stride, count, touched, keep,
         limit=_design_array(bytes(raw))[0],
         required=(expected_cmdrs + enemy_expected_cmdrs
-                  + len(player_extra_cmdrs) + len(enemy_extra_cmdrs)))
+                  + len(player_extra_cmdrs) + len(enemy_extra_cmdrs)
+                  + player_report_expected_cmdrs))
     if scrubbed:
         print(f'  prepared {len(scrubbed)} commander record slot(s)')
 
     # Which types actually led units: the orders file list when present,
     # else the .trn one.
-    cmdr_counts = (trn_parse.commander_type_counts(h2_raw, set(provinces))
+    cmdr_counts = (trn_parse.commander_type_counts(h2_raw, set(province_copy))
                    if h2_raw else {})
     if not cmdr_counts:
         cmdr_counts = trn_parse.commander_type_counts(src_raw,
-                                                      set(provinces))
+                                                      set(province_copy))
 
     # ---- transplant named commanders: name, squads and battle orders ------
     # A .trn source stores each commander as a com record (name, squad slots,
@@ -3696,7 +4272,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             comid, c_start, c_uidpos = scrubbed.pop(0)
             auid = arena_uid[r['uid']]
             cmdr_type = r['type']
-            new_squads: list[int] = []
+            new_squads: list[tuple[int, int]] = []
             n_members = 0
             unit_name = gamedata.units().get(cmdr_type)
 
@@ -3704,7 +4280,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             for sq in valid_slots:
                 assigned = _try_assign_squad(sq, cmdr_prov)
                 if assigned:
-                    new_squads.append(max_squad)
+                    new_squads.append((max_squad, len(assigned)))
                     n_members += len(assigned)
 
             # --- Part B (pri 0 & 1 only): leftover stamped squads same prov ---
@@ -3728,7 +4304,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                             break
                         assigned = _try_assign_squad(sq, cmdr_prov)
                         if assigned:
-                            new_squads.append(max_squad)
+                            new_squads.append((max_squad, len(assigned)))
                             n_members += len(assigned)
                             need -= 1
 
@@ -3746,9 +4322,10 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                              0xFFFFFFFF)
             com_splices.append((c_start, c_uidpos + COM_BODY,
                                 _com_record(comid, com['name'], auid,
-                                            new_squads, bytes(tail))))
+                                            _squad_slots(new_squads),
+                                            bytes(tail))))
             h2_commanders.append((comid, com['name'], auid,
-                                  list(new_squads), bytes(tail)))
+                                  _squad_slots(new_squads), bytes(tail)))
             reserved.add(auid)
             if cmdr_counts.get(r['type'], 0) > 0:
                 cmdr_counts[r['type']] -= 1
@@ -3764,8 +4341,19 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             raise RuntimeError(
                 f'commander copy incomplete: {len(h2_commanders)} of '
                 f'{expected_cmdrs} source records transplanted')
-        if h2_raw and h2_commanders:
-            god_com = _trn_commander(h2_raw, god_uid) if god_uid else None
+        if h2_raw and (h2_commanders or player_god_com is not None):
+            # Priority for the god's own com record: the battle report's VCR
+            # record (battle-time equipment, gems, paths and script), else the
+            # .2h, else the .trn.
+            god_com = (player_god_com
+                       or (_trn_commander(h2_raw, god_uid) if god_uid else None))
+            if god_com is None and god_uid:
+                # The .2h only lists commanders with orders; a sleeping
+                # pretender has no record there at all.  Without the fallback
+                # the arena .2h got an all-zero tail, and the client draws the
+                # pretender's paths, items, gems and battle script from it --
+                # the copy showed a blank god.  The .trn record carries them.
+                god_com = _trn_commander(src_raw, god_uid)
             gt = bytearray(god_com['tail']) if god_com else bytearray(COM_TAIL)
             if struct.unpack_from('<I', gt, T_PROV)[0]:
                 struct.pack_into('<I', gt, T_PROV, player_prov)
@@ -3781,6 +4369,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # in the player's own .trn: name, squads, battle orders and equipment.
     # Transplant those records as well; simply re-arming a blank com slot
     # would leave the copied commander without its source items.
+    enemy_h2_cmdrs: list[tuple[int, str, int, list[int], bytes]] = []
     if enemy_report_records and scrubbed:
         slots_by_index = {i: off
                           for i, off in enumerate(e_used[1:1 + len(enemy_specs)])}
@@ -3847,6 +4436,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                 max_squad = max(max_squad, v)
         taken: set[int] = set()
         copied = 0
+        skipped = 0
         for r in enemy_report_records:
             auid = report_uid.get(r['uid'])
             if auid is None:
@@ -3854,29 +4444,40 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             com = r.get('com') or _trn_commander(trn_raw, r['uid'])
             if com is None:
                 continue
+            com_tail = com.get('tail') or b''
+            if len(com_tail) != 181:
+                skipped += 1
+                print(f'  NOTE: battle-report commander uid {r["uid"]} '
+                      f'(type {r["type"]}) has a {len(com_tail)}-byte com '
+                      f'tail (expected 181); name and equipment not copied')
+                continue
+            # Plan the squads first; a com leading no unit would attach
+            # equipment to an empty leader, which the host rejects with
+            # "bad equip".
+            plan: list[list[int]] = []
+            for sq in com['squads']:
+                members = [u for u in stamped.get(sq, [])
+                           if u in report_uid and report_uid[u] not in taken]
+                if not members:
+                    continue
+                plan.append(members)
+                for u in members:
+                    taken.add(report_uid[u])
+            n_members = sum(len(m) for m in plan)
             if not scrubbed:
                 raise RuntimeError(
                     f'ran out of freed com slots before enemy commander '
                     f'uid {r["uid"]} (type {r["type"]})')
             comid, c_start, c_uidpos = scrubbed.pop(0)
             new_squads: list[int] = []
-            n_members = 0
-            for sq in com['squads']:
-                members = [u for u in stamped.get(sq, []) if u in report_uid]
-                if not members:
-                    continue
-                chosen = [u for u in members if report_uid[u] not in taken]
-                if not chosen:
-                    continue
+            for chosen in plan:
                 max_squad += 1
                 new_squads.append(max_squad)
-                n_members += len(chosen)
                 for u in chosen:
                     a = report_uid[u]
-                    taken.add(a)
                     struct.pack_into('<I', raw, base + (a - 1) * stride + 28,
                                      max_squad)
-            tail = bytearray(com['tail'])
+            tail = bytearray(com_tail)
             if struct.unpack_from('<I', tail, T_PROV)[0]:
                 struct.pack_into('<I', tail, T_PROV, enemy_prov)
             if struct.unpack_from('<I', tail, T_UIDREF)[0]:
@@ -3884,9 +4485,13 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                                  report_uid.get(struct.unpack_from('<I', tail, T_UIDREF)[0], 0))
             struct.pack_into('<I', raw, base + (auid - 1) * stride + 28,
                              0xFFFFFFFF)
+            slots = _squad_slots(list(zip(new_squads, map(len, plan))))
             com_splices.append((c_start, c_uidpos + COM_BODY,
                                 _com_record(comid, com['name'], auid,
-                                            new_squads, bytes(tail))))
+                                            slots, bytes(tail),
+                                            keep_layout=True)))
+            enemy_h2_cmdrs.append((comid, com['name'], auid, slots,
+                                   bytes(tail)))
             reserved.add(auid)
             copied += 1
             unit = gamedata.units().get(r['type'])
@@ -3894,10 +4499,13 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                   f'({unit.name if unit else r["type"]}) kept as com {comid}: '
                   f'{len(new_squads)} squad(s), {n_members} units, '
                   f'name + orders + equipment copied')
-        if copied != enemy_expected_cmdrs:
+        if skipped:
+            print(f'  skipped {skipped} battle-report commander(s) that lead '
+                  f'no unit or carry a malformed com record')
+        if copied + skipped != enemy_expected_cmdrs:
             raise RuntimeError(
-                f'enemy commander copy incomplete: {copied} of '
-                f'{enemy_expected_cmdrs} source records transplanted')
+                f'enemy commander copy incomplete: {copied} copied + '
+                f'{skipped} skipped of {enemy_expected_cmdrs} source records')
 
     # Configured extra commanders have no source com record to copy.  Give
     # each one a fresh record whose tail carries the requested final magic
@@ -3906,7 +4514,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # also appended to that side's .2h; without it the host drops the new
     # commander from the .trn it writes and the unit never shows in game.
     extra_h2: dict[str, list[tuple[int, str, int, list[int], bytes]]] = {
-        'player': [], 'enemy': []}
+        'player': [], 'enemy': list(enemy_h2_cmdrs)}
     for side, commanders, start, used, province in (
             ('player', player_extra_cmdrs, player_extra_start, p_used,
              player_prov),
@@ -3952,7 +4560,30 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                   f'(id {spec["id"]}) as com {comid}: '
                   f'paths {_path_text(spec["paths"])}')
 
-    if enemy_god_paths is not None:
+    if enemy_god_com is not None:
+        # The enemy god came from a battle report: its com record holds the
+        # battle-time equipment, carried gems, magic paths and script.  Keep
+        # the arena's forged god identity (name/squads) and take the whole
+        # tail, exactly like the player's god.
+        e_god_uid = (e_used[0] - base) // stride + 1
+        found = _find_com(bytes(raw), base, stride, count, e_god_uid)
+        if found is None:
+            raise ValueError(
+                f'battle report pretender: no com record for the enemy god '
+                f'(unit id {e_god_uid})')
+        comid, c_start, c_uidpos, name, squads, tail = found
+        tail = bytearray(enemy_god_com['tail'])
+        if struct.unpack_from('<I', tail, T_PROV)[0]:
+            struct.pack_into('<I', tail, T_PROV, enemy_prov)
+        ref = struct.unpack_from('<I', tail, T_UIDREF)[0]
+        if ref in arena_uid:
+            struct.pack_into('<I', tail, T_UIDREF, arena_uid[ref])
+        com_splices.append((c_start, c_uidpos + COM_BODY,
+                            _com_record(comid, name, e_god_uid, [],
+                                        bytes(tail))))
+        print(f'  enemy pretender com record copied from the battle report '
+              f'("{name}")')
+    elif enemy_god_paths is not None:
         # The enemy god keeps its forged com record; rewrite the ten path
         # bytes in its tail, in ftherlnd and in the enemy orders file.
         e_god_uid = (e_used[0] - base) // stride + 1
@@ -3968,7 +4599,8 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                             _com_record(comid, name, e_god_uid,
                                         squads, bytes(tail))))
         _h2_set_god_paths(
-            save / f'{enemy_nation.file_name_base}.2h', enemy_god_paths)
+            save / f'{enemy_nation.file_name_base}.2h', enemy_god_paths,
+            e_god_uid)
         print(f'  enemy pretender magic paths: '
               f'{_path_text(enemy_god_paths)}')
 
@@ -3989,7 +4621,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                                         squads, bytes(tail))))
         _h2_set_god_paths(
             save / f'{gamedata.nations()[own_nation].file_name_base}.2h',
-            player_god_paths)
+            player_god_paths, p_god_uid)
         print(f'  player pretender magic paths: '
               f'{_path_text(player_god_paths)}')
 
@@ -4008,8 +4640,9 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             if god_slot is not None:
                 src_god = struct.unpack_from(
                     '<I', src_raw, god_slot + len(_enc(src_name)) + 1)[0]
-        src_com = (_source_com(h2_raw, src_raw, src_god)
-                   if src_god is not None else None)
+        src_com = (player_god_com
+                   or (_source_com(h2_raw, src_raw, src_god)
+                       if src_god is not None else None))
         p_god_uid = (p_used[0] - base) // stride + 1
         found = _find_com(bytes(raw), base, stride, count, p_god_uid)
         if src_com is not None and found is not None:
@@ -4028,15 +4661,167 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             com_splices.append((c_start, c_uidpos + COM_BODY,
                                 _com_record(comid, src_name, p_god_uid,
                                             [], bytes(tail))))
-            print(f'  player pretender com record copied from source save '
+            print(f'  player pretender com record copied from '
+                  f'{"the battle report" if player_god_com is not None else "source save"} '
                   f'("{src_name}")')
+
+    # Battle-report commanders on the player side carry their com record
+    # (name, magic paths, equipment, carried gems and battle script) in the
+    # player's own .trn.  Mirror the enemy transplant above so a province
+    # read from a battle report keeps its commanders armed.
+    if player_report_records and scrubbed:
+        report_start = len(src_specs) - player_report_count
+        slots_by_index = {i: off
+                          for i, off in enumerate(p_used[1:1 + len(src_specs)])}
+        report_uid: dict[int, int] = {}
+        for r in player_report_records:
+            idx = report_start + r['report_index']
+            off = slots_by_index.get(idx)
+            if off is None:
+                raise ValueError(
+                    f'battle-report unit uid {r["uid"]} maps outside the '
+                    f'player army (composition index {idx})')
+            slot_type = struct.unpack_from('<H', raw, off + 32)[0]
+            if slot_type != r['type']:
+                raise ValueError(
+                    f'strict battle-report mapping mismatch: source uid '
+                    f'{r["uid"]} type {r["type"]} landed on arena slot '
+                    f'holding type {slot_type}')
+            report_uid[r['uid']] = (off - base) // stride + 1
+
+        vcr_sq: dict[int, int] = {}
+        for entry in player_report_entries:
+            prov = int(entry['province'])
+            side = entry['copy']
+            rep = [r for r in trn_parse.battle_reports(trn_raw, prov)
+                   if (side == 'attacker'
+                       and r['attacker'] == entry.get('attacker'))
+                   or (side == 'defender'
+                       and r['defender'] == entry.get('defender'))]
+            if not rep:
+                continue
+            if 'seq' in entry and entry['seq'] < len(rep):
+                rep = rep[entry['seq']]
+            else:
+                rep = rep[0]
+            side_nat = rep[side]
+            snaps = _scan_vcr_snapshots(trn_raw, rep['vcr'], rep['bcd'],
+                                        side_nat)
+            for uid, info in snaps.items():
+                if info['squad'] != 0xFFFFFFFF:
+                    vcr_sq[uid] = info['squad']
+
+        stamped: dict[int, list[int]] = {}
+        for r in player_report_records:
+            sq = None
+            if r['pos'] is not None:
+                sq = struct.unpack_from('<I', trn_raw, r['pos'] + 32)[0]
+            if sq is None and r.get('uid') in vcr_sq:
+                sq = vcr_sq[r['uid']]
+            if sq is not None and sq != 0xFFFFFFFF:
+                stamped.setdefault(sq, []).append(r['uid'])
+        max_squad = 0
+        for k in range(count):
+            v = struct.unpack_from('<I', raw, base + k * stride + 28)[0]
+            if v != 0xFFFFFFFF:
+                max_squad = max(max_squad, v)
+        taken: set[int] = set()
+        copied = 0
+        skipped = 0
+        for r in player_report_records:
+            auid = report_uid.get(r['uid'])
+            if auid is None:
+                continue
+            com = r.get('com') or _trn_commander(trn_raw, r['uid'])
+            if com is None:
+                continue
+            com_tail = com.get('tail') or b''
+            if len(com_tail) != 181:
+                # A malformed com body would splice garbage into the orders
+                # file; the host then aborts with "bad equip".
+                skipped += 1
+                print(f'  NOTE: battle-report commander uid {r["uid"]} '
+                      f'(type {r["type"]}) has a {len(com_tail)}-byte com '
+                      f'tail (expected 181); name and equipment not copied')
+                continue
+            # Plan the squads this commander leads WITHOUT touching state yet.
+            # A com that leads no unit would attach equipment to an empty
+            # leader -- exactly what the host rejects as "bad equip".
+            plan: list[list[int]] = []
+            for sq in com['squads']:
+                members = [u for u in stamped.get(sq, [])
+                           if u in report_uid and report_uid[u] not in taken]
+                if not members:
+                    continue
+                plan.append(members)
+                for u in members:
+                    taken.add(report_uid[u])
+            n_members = sum(len(m) for m in plan)
+            if not scrubbed:
+                raise RuntimeError(
+                    f'ran out of freed com slots before player commander '
+                    f'uid {r["uid"]} (type {r["type"]})')
+            comid, c_start, c_uidpos = scrubbed.pop(0)
+            new_squads: list[int] = []
+            for chosen in plan:
+                max_squad += 1
+                new_squads.append(max_squad)
+                for u in chosen:
+                    a = report_uid[u]
+                    struct.pack_into('<I', raw, base + (a - 1) * stride + 28,
+                                     max_squad)
+            tail = bytearray(com_tail)
+            if struct.unpack_from('<I', tail, T_PROV)[0]:
+                struct.pack_into('<I', tail, T_PROV, player_prov)
+            if struct.unpack_from('<I', tail, T_UIDREF)[0]:
+                struct.pack_into(
+                    '<I', tail, T_UIDREF,
+                    report_uid.get(struct.unpack_from('<I', tail, T_UIDREF)[0],
+                                   0))
+            struct.pack_into('<I', raw, base + (auid - 1) * stride + 28,
+                             0xFFFFFFFF)
+            slots = _squad_slots(list(zip(new_squads, map(len, plan))))
+            com_splices.append((c_start, c_uidpos + COM_BODY,
+                                _com_record(comid, com['name'], auid,
+                                            slots, bytes(tail))))
+            reserved.add(auid)
+            extra_h2['player'].append(
+                (comid, com['name'], auid, slots, bytes(tail)))
+            copied += 1
+            unit = gamedata.units().get(r['type'])
+            print(f'  player commander "{com["name"]}" '
+                  f'({unit.name if unit else r["type"]}) kept as com {comid}: '
+                  f'{len(new_squads)} squad(s), {n_members} units, '
+                  f'name + orders + equipment copied')
+        if skipped:
+            print(f'  skipped {skipped} battle-report commander(s) that lead '
+                  f'no unit or carry a malformed com record')
+        if copied + skipped != player_report_expected_cmdrs:
+            raise RuntimeError(
+                f'player commander copy incomplete: {copied} copied + '
+                f'{skipped} skipped of {player_report_expected_cmdrs} '
+                f'source records')
 
     for side, nation in (('player', gamedata.nations()[own_nation]),
                          ('enemy', enemy_nation)):
         records = extra_h2[side]
-        if records:
+        god_tail = None
+        if side == 'enemy' and enemy_god_com is not None:
+            # Same battle-report tail as the ftherlnd record; the client
+            # reads the god's equipment, gems, paths and script here.
+            tail = bytearray(enemy_god_com['tail'])
+            if struct.unpack_from('<I', tail, T_PROV)[0]:
+                struct.pack_into('<I', tail, T_PROV, enemy_prov)
+            ref = struct.unpack_from('<I', tail, T_UIDREF)[0]
+            if ref in arena_uid:
+                struct.pack_into('<I', tail, T_UIDREF, arena_uid[ref])
+            god_tail = bytes(tail)
+        if records or god_tail is not None:
+            god_unit = ((p_used[0] if side == 'player' else e_used[0]) - base) \
+                // stride + 1
             _h2_add_commanders(
-                save / f'{nation.file_name_base}.2h', records)
+                save / f'{nation.file_name_base}.2h', records, god_unit,
+                god_tail=god_tail)
 
     # Re-arm commander units.  In the source save these units carried com
     # records; without one the host treats them as plain units, so hand them
@@ -4051,6 +4836,9 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         if cmdr_counts.get(typ, 0) > 0:
             comid, _c_start, cpos = scrubbed.pop(0)
             struct.pack_into('<I', raw, cpos, uid)
+            _tail = bytearray(raw[cpos + 24:cpos + 205])
+            _sanitize_items(_tail, f're-armed com {comid}')
+            raw[cpos + 24:cpos + 205] = _tail
             cmdr_counts[typ] -= 1
             print(f'  com {comid} re-armed for unit {uid} '
                   f'({gamedata.units().get(typ).name if typ in gamedata.units() else typ})')
@@ -4156,12 +4944,19 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
     from collections import Counter
     tries = attempts if cfg.get('host', True) else 1
     indepstr = 0
+    last_count = -1
     for attempt in range(1, tries + 1):
         try:
             result = build(cfg, indepstr=indepstr)
         except ArenaCapacityError as exc:
             if attempt >= tries:
                 raise
+            if exc.count <= last_count:
+                raise ArenaCapacityError(
+                    f'{exc}; the unit table stopped growing at {exc.count} '
+                    f'records — copy fewer units or use a larger arena map',
+                    exc.count, exc.required) from None
+            last_count = exc.count
             nxt = _next_indepstr(indepstr, exc.count, exc.required)
             if nxt <= indepstr:
                 raise ArenaCapacityError(
@@ -4196,6 +4991,14 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
             if any(k in s for k in ('has god', 'hostack', 'put turn data',
                                     'Error', 'error', 'Något gick fel')):
                 print(' ', s[:160])
+        if 'bad equip' in log.lower():
+            # Recreating the arena just reproduces the same rejection, so
+            # fail loudly instead of spinning through the retry loop.
+            raise RuntimeError(
+                f'{result["game"]}: the host rejected the arena with '
+                f'"bad equip" — a transplanted commander carries an item its '
+                f'slot cannot use; not retrying (copy one side, fewer '
+                f'provinces or a smaller battle)')
         if 'hostack 1' in log:
             # The host rebuilt the designs from its own state and dropped part
             # of a copied bless; write the source design back into ftherlnd and
@@ -4219,5 +5022,7 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
 
 
 if __name__ == '__main__':
-    import sys
-    main(sys.argv[1] if len(sys.argv) > 1 else 'dom6arena/arena_config.json')
+    # No argument: use the config next to this checkout, whether the tool is
+    # started from the project root or from inside the package.
+    default = Path(__file__).resolve().parent.parent / 'arena_config.json'
+    main(sys.argv[1] if len(sys.argv) > 1 else str(default))

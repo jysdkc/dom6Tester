@@ -553,18 +553,25 @@ def scout_army(raw: bytes, province_id: int) -> list[tuple[int, int | None]]:
 #
 #     "vcr_VCR" [u32 ver=4][u32 province][u32 defender][u32 attacker]
 #     [u32 cstlmode][u32 seed] ... [u32 province again at vcr+39] ...
-#     then a "BCD\x17\x19\x64" block of 8- or
-#     10-byte entries, terminated by ff 2c:
+#     then a "BCD\x17\x19\x64" block of 8-, 10- or 12-byte entries,
+#     terminated by ff 2c:
 #         [u8 side][81][u16 unit_type][u8 count_lo][u8 count_hi][00 00][u16 ?]
 #         [u8 side][u8 unit_type][u8 count_lo][u8 count_hi][00 00 00 00]
+#         [u8 side][81][u16 unit_type][81][u16 count][00 00][u16 ?]  (12 bytes)
+# The last form only appears for large stacks (province 61: 582 Se'ir,
+# 226 Piconye Defenders); its count is a u16 at +5 and the record is two
+# bytes longer, so a fixed 10-byte step desynchronises the REST of the block
+# -- measured on province 61 that cut the attacker's start army from 1141
+# units to the first 387 and corrupted every later section.
 #
 # The field names come from the writer's own debug string in the exe:
 #   "  createvcr to%d lnr%d (own %d/%d) def%d att%d cstlmode%d seed%d\n"
 # so +8 is the *defender* nation, +12 the *attacker*, +16 the castle mode and
 # +20 the battle's RNG seed.
 #
-# side 0/1 = attacker's army, side 2/3 = defender's army (0/2 = at battle
-# start, 1/3 = what is left at the end).  Counts: lo byte, except commander
+# side 0/1 = attacker's army, 2/3 = defender's army (0/2 = at battle
+# start, 1/3 = what is left at the end); 4/5 are unrelated to either army.
+# Counts: lo byte, except commander
 # entries which store a 1 in the hi byte instead (lo=0).  Battle casualties
 # are absent from the unit record table (dead units are removed), so these
 # BCD blocks are the only place a wiped-out army (e.g. a relieving nation that
@@ -579,8 +586,10 @@ def battle_reports(raw: bytes, province: int) -> list[dict]:
 
     Each entry: ``{'defender': nation, 'attacker': nation,
     'cstlmode': int, 'seed': int,
-    'start': {nation: {unit_type: count}}}`` with the armies as they were
-    when the battle began.
+    'start': {nation: {unit_type: count}},
+    'end': {nation: {unit_type: count}}}`` with the armies as they were
+    when the battle began and the units left when it ended (side 1/3 of the
+    BCD block, casualties absent).
     """
     out: list[dict] = []
     pos = 0
@@ -602,30 +611,57 @@ def battle_reports(raw: bytes, province: int) -> list[dict]:
             continue
         start: dict[int, dict[int, int]] = {nat_a: {}, nat_b: {}}
         start_cmdrs: dict[int, dict[int, int]] = {nat_a: {}, nat_b: {}}
+        end: dict[int, dict[int, int]] = {nat_a: {}, nat_b: {}}
+        end_cmdrs: dict[int, dict[int, int]] = {nat_a: {}, nat_b: {}}
         i = b + len(BCD_HEAD)
+        last_side = -1
         while i + 8 <= len(raw) and raw[i:i + 2] != b'\xff\x2c':
             side = raw[i]
-            if raw[i + 1] == 0x81:
-                if i + 10 > len(raw):
-                    break
-                typ = struct.unpack_from('<H', raw, i + 2)[0]
-                lo, hi = raw[i + 4], raw[i + 5]
-                step = 10
+            typ = count = None
+            step = 0
+            is_cmdr = False
+            if side <= 5:
+                if raw[i + 1] == 0x81:
+                    typ = struct.unpack_from('<H', raw, i + 2)[0]
+                    if typ in VALID_UNITS:
+                        if raw[i + 4] == 0x81:
+                            # Large stack: u16 count at +5 and the record is
+                            # two bytes longer (see the block layout above).
+                            count = struct.unpack_from('<H', raw, i + 5)[0]
+                            step = 12
+                        else:
+                            lo, hi = raw[i + 4], raw[i + 5]
+                            count, is_cmdr, step = lo or hi, lo == 0 and hi, 10
+                else:
+                    typ = raw[i + 1]
+                    if typ in VALID_UNITS:
+                        lo, hi = raw[i + 2], raw[i + 3]
+                        count, is_cmdr, step = lo or hi, lo == 0 and hi, 8
+            # The four army sections come in file order (0, 2, 1, 3 ...), so a
+            # smaller side after a larger one can only be a byte inside the
+            # previous record (the 8-byte form's zero tail matches such bytes).
+            if step and side >= last_side:
+                nation = nat_b if side in (0, 1) else nat_a
+                if count:
+                    # 0/2 = army at battle start, 1/3 = what is left at the
+                    # end; survivors are the side the "after battle" copy
+                    # reads.  4/5 are not either army's list.
+                    if side in (0, 1, 2, 3):
+                        table = start if side in (0, 2) else end
+                        table[nation][typ] = table[nation].get(typ, 0) + count
+                        if is_cmdr:
+                            cmdrs = (start_cmdrs if side in (0, 2)
+                                     else end_cmdrs)
+                            cmdrs[nation][typ] = (cmdrs[nation].get(typ, 0)
+                                                  + count)
+                last_side = side
+                i += step
             else:
-                typ = raw[i + 1]
-                lo, hi = raw[i + 2], raw[i + 3]
-                step = 8
-            count = lo if lo else hi
-            nation = nat_b if side in (0, 1) else nat_a
-            if side in (0, 2) and typ in VALID_UNITS and count:
-                start[nation][typ] = start[nation].get(typ, 0) + count
-                if lo == 0 and hi:
-                    start_cmdrs[nation][typ] = (
-                        start_cmdrs[nation].get(typ, 0) + count)
-            i += step
+                i += 1
         out.append({'defender': nat_a, 'attacker': nat_b,
                     'cstlmode': cstl, 'seed': seed, 'start': start,
-                    'start_commanders': start_cmdrs,
+                    'start_commanders': start_cmdrs, 'end': end,
+                    'end_commanders': end_cmdrs,
                     'vcr': v, 'bcd': b})
     return out
 
@@ -718,6 +754,43 @@ def _looks_like_record(raw: bytes, pos: int) -> bool:
     return (typ in VALID_UNITS and hp > 0
             and 1 <= here <= _province_max
             and 1 <= origin <= _province_max)
+
+
+def vcr_ranges(raw: bytes) -> list[tuple[int, int]]:
+    """Byte ranges of the battle replays embedded in a .trn.
+
+    Each replay starts at its ``vcr_VCR`` magic and runs to the ``BCD``
+    statistics block that closes it.  The replay embeds the battle-start
+    unit snapshots, whose 173 byte bodies have the very same layout as a
+    .trn unit record, so a plain unit scan reads them as units standing in
+    the province now -- dead units included.
+    """
+    out: list[tuple[int, int]] = []
+    pos = 0
+    while True:
+        v = raw.find(VCR_MAGIC, pos)
+        if v < 0:
+            break
+        b = raw.find(BCD_HEAD, v + len(VCR_MAGIC))
+        if b < 0:
+            break
+        out.append((v, b))
+        pos = b
+    return out
+
+
+def current_unit_records(raw: bytes) -> list[dict]:
+    """:func:`unit_records` without the records inside battle replays.
+
+    This is the army the province screen shows *now*.  Use
+    :func:`unit_records` when the goal is the battle's start-of-battle
+    composition: there the replay snapshots are the wanted records.
+    """
+    ranges = vcr_ranges(raw)
+    if not ranges:
+        return unit_records(raw)
+    return [r for r in unit_records(raw)
+            if not any(lo <= r['pos'] < hi for lo, hi in ranges)]
 
 
 def unit_records(raw: bytes) -> list[dict]:

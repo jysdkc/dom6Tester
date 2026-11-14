@@ -26,6 +26,7 @@ class Unit:
     name: str
     gold: int
     resources: int
+    hp: int = 0
     paths: tuple[int, ...] = ()
     startdom: int = 0
     pathcost: int = 0
@@ -97,6 +98,7 @@ def units() -> dict[int, Unit]:
             name=cell(row, "name", f"unit {uid}"),
             gold=max(0, basecost - GOLD_OFFSET) if basecost >= GOLD_OFFSET else basecost,
             resources=rcost,
+            hp=number("hp"),
             paths=tuple(number(k) for k in ("F", "A", "W", "E", "S",
                                             "D", "N", "G", "B", "H")),
             startdom=number("startdom"),
