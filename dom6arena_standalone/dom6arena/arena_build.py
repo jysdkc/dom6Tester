@@ -1748,9 +1748,10 @@ def _player_trn(save_dir: Path, nation: int) -> tuple[Path, bytes]:
     Fallback (PBEM / hotseat saves where the player's own turn is not
     stored under its canonical name, or mod nations that gamedata does not
     know about): scan every ``*.trn`` in the save folder and pick the one
-    whose unit records carry the most entries for ``nation``.  A folder
-    with a single .trn is unambiguous and always accepted.  A folder with
-    several .trn where none contains any unit of the target nation raises
+    whose unit records carry the most entries for ``nation``.  Files that
+    carry no unit of ``nation`` belong to another player and are ignored,
+    even when the folder holds nothing else.  A folder with several .trn
+    where none contains any unit of the target nation raises
     ``FileNotFoundError`` — the caller genuinely has no data to copy.
 
     The orders file (``.2h``) is derived from the selected .trn stem by
@@ -1764,42 +1765,55 @@ def _player_trn(save_dir: Path, nation: int) -> tuple[Path, bytes]:
         if exact.is_file():
             return exact, exact.read_bytes()
 
-    # -- 2. Fallback: scan all .trn, pick the one with most target-nation units
+    # -- 2. Fallback: scan the .trn files that carry this nation -----------
+    # Every turn file is named after its nation, and a save folder can hold
+    # another player's file next to ours (late_gath.trn beside
+    # late_piconye.trn).  Such a file is someone else's view AND someone
+    # else's orders, so it never qualifies -- not even as a last resort: it
+    # also lists copies of our own units (late_gath.trn carries 823 unit
+    # records of nation 120), so counting units cannot tell the files apart.
     trn_candidates = sorted(save_dir.glob('*.trn'))
     if not trn_candidates:
         raise FileNotFoundError(
             f'no .trn files found in {save_dir}; cannot read nation '
             f'{nation}\'s army')
 
-    if len(trn_candidates) == 1:
-        chosen = trn_candidates[0]
-        return chosen, chosen.read_bytes()
-
-    ranked: list[tuple[int, Path]] = []
-    for trn_path in trn_candidates:
-        try:
-            raw = trn_path.read_bytes()
-            recs = trn_parse.unit_records(raw)
-            count = sum(1 for r in recs if r['nation'] == nation)
-        except Exception:
-            count = 0
-        ranked.append((count, trn_path))
-
-    ranked.sort(key=lambda x: -x[0])
-    best_count, best_path = ranked[0]
-    if best_count == 0:
+    canon_base = nations[nation].file_name_base if nation in nations else None
+    bases = {n.file_name_base: n.id for n in nations.values()}
+    foreign = [p for p in trn_candidates
+               if p.stem in bases and bases[p.stem] != nation]
+    own_files = [p for p in trn_candidates if p not in foreign]
+    if not own_files:
         raise FileNotFoundError(
-            f'no .trn in {save_dir} contains units of nation {nation} '
-            f'(scanned {len(trn_candidates)} files: '
-            f'{", ".join(p.name for p in trn_candidates)})')
+            f'{save_dir} holds no turn file of nation {nation} '
+            f'(found {", ".join(p.name for p in trn_candidates)}); '
+            f'other nations\' .trn/.2h files are ignored')
+    if len(own_files) > 1:
+        # Non-canonical names: several candidates, take the one that lists
+        # the most of our units.
+        scored = []
+        for trn_path in own_files:
+            try:
+                scored.append((sum(1 for r in trn_parse.unit_records(
+                    trn_path.read_bytes()) if r['nation'] == nation), trn_path))
+            except Exception:
+                scored.append((0, trn_path))
+        scored.sort(key=lambda x: -x[0])
+        best_count, best_path = scored[0]
+        if best_count == 0:
+            raise FileNotFoundError(
+                f'no .trn in {save_dir} lists units of nation {nation} '
+                f'(candidates: {", ".join(p.name for p in own_files)})')
+    else:
+        best_path = own_files[0]
     # Warn if the fallback picked a non-canonical file
-    if nation in nations:
-        canonical = save_dir / f'{nations[nation].file_name_base}.trn'
+    if canon_base is not None:
+        canonical = save_dir / f'{canon_base}.trn'
         if best_path != canonical:
             import sys as _sys
             print(f'  WARNING: canonical {canonical.name!r} missing; '
-                  f'falling back to {best_path.name!r} '
-                  f'({best_count} units match)', file=_sys.stderr)
+                  f'falling back to {best_path.name!r}',
+                  file=_sys.stderr)
     return best_path, best_path.read_bytes()
 
 
@@ -2350,10 +2364,11 @@ def _split_report_entries(picks: list[dict], own_nation: int
 
 def _pick_battle_reports(raw: bytes, provs,
                          own_nation: int | None = None) -> list[dict]:
-    """Interactively pick one battle report per scout province.
+    """Interactively pick one battle report per configured province.
 
-    Every battle report whose province is listed in ``enemy.provinces``
-    is offered.  Each report is shown as ``[seq, name, uuid, attacker,
+    Every battle report of a province listed in ``provinces`` /
+    ``enemy.provinces`` is offered; reports elsewhere in the .trn are not.
+    Each report is shown as ``[seq, name, uuid, attacker,
     defender]``: the seq is a 1-based counter per province, the uuid is the
     VCR offset that later pinpoints the report inside the .trn, attacker and
     defender are the nation names, and the name is 'battle' or
@@ -2415,6 +2430,8 @@ def _pick_battle_reports(raw: bytes, provs,
                 return 'after'
             print('input error')
 
+    # Only the configured provinces are offered: their reports are the army
+    # source the config asks for.  A report elsewhere in the .trn is ignored.
     for prov in provs:
         prov = int(prov)
         reports = trn_parse.battle_reports(raw, prov)
@@ -2433,7 +2450,7 @@ def _pick_battle_reports(raw: bytes, provs,
             print('0 skip copy battle report  usually you may skip  '
                   'assasination')
             for seq, name, uuid, att_name, def_name, _, _ in battles:
-                print(f'{seq} copy {name} '
+                print(f'{seq} copy {name}. '
                       f'attacker: {att_name} VS defender: {def_name}')
             line = _ask()
             if line is None:          # end of input: copy no more reports
@@ -2701,7 +2718,13 @@ def _enemy_army(raw: bytes, enemy_cfg: dict,
         # hold the fort while the enemy holds the land.  An army scouted from
         # afar has no unit table rows, so the report is used then.
         visible, orphans = _visible_enemy_units(raw, prov, enemy_nation)
-        if visible:
+        # The unit table only wins when it plausibly IS the whole garrison.
+        # A report that knows far more units means the few .trn rows are just
+        # a sighting (a battle report or adjacent scouting), not the province
+        # screen: province 80 had 2 visible rows against a report of about
+        # 1150 units, and using them dropped the entire army.
+        if visible and (report.total is None
+                        or len(visible) >= report.total * 0.9):
             before = len(army)
             mounts = 0
             for spec in visible:
@@ -3012,6 +3035,57 @@ def _clear_independents(raw: bytearray, base: int, stride: int, count: int,
         struct.pack_into('<H', raw, off + 32, 0)
         struct.pack_into('<HH', raw, off + 36, 0, 0)
     return cleared
+
+
+def _grow_unit_table(raw: bytearray, base: int, stride: int, count: int,
+                     extra: int) -> int:
+    """Append ``extra`` empty records to the fixed unit table.
+
+    The table is a flat array of complete 173 byte records closed by an
+    0xFFFFFFFF sentinel.  It is sized when the game is created, from the
+    random independent garrisons, so a big copied army overflows it and a
+    short table used to force a full arena recreation.
+
+    Inserting records before the sentinel grows it.  Measured on a 3146
+    record arena: 300 inserted records survived two hosts and reached the
+    .trn.  The records must be complete -- a minimal record (uid, type, hp,
+    province, nation only) stays in ftherlnd but never joins the province,
+    while a copy of a live record is accepted -- so one live ordinary record
+    is used as the template and only its identity fields are reset.
+
+    Returns the new record count.
+    """
+    if extra <= 0:
+        return count
+    template = None
+    for k in range(count):
+        off = base + k * stride
+        if (struct.unpack_from('<H', raw, off + 64)[0]
+                and struct.unpack_from('<H', raw, off + 42)[0] != 636
+                and raw[off + 21] != 4):
+            template = bytes(raw[off:off + stride])
+            break
+    if template is None:
+        template = bytes(stride)
+    rows = bytearray()
+    for i in range(extra):
+        rec = bytearray(template)
+        struct.pack_into('<I', rec, 0, count + 1 + i)     # uid
+        struct.pack_into('<I', rec, 28, 0xFFFFFFFF)       # no squad
+        struct.pack_into('<H', rec, 32, 0)                # type
+        struct.pack_into('<H', rec, 34, 0)                # hp
+        struct.pack_into('<HH', rec, 36, 0, 0)            # province
+        rec[21] = 0                                       # not a com type
+        rec[25] = 0                                       # rider flag
+        rec[26] = 0                                       # mount flag
+        struct.pack_into('<H', rec, 42, 0)                # no god marker
+        struct.pack_into('<H', rec, 64, 0)                # nation
+        struct.pack_into('<i', rec, 66, -1)               # alive marker
+        struct.pack_into('<i', rec, 81, -1)               # no master
+        rows += rec
+    end = base + count * stride
+    raw[end:end] = rows
+    return count + extra
 
 
 def _write_nation_army(raw: bytearray, base: int, stride: int, count: int,
@@ -3966,15 +4040,15 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
               f'{sorted(counts.items())}')
 
     # The unit table must hold both full armies, both god records and the
-    # kept debug grant.  Its size is fixed at creation (the random
-    # independent garrisons are most of it), so a short table can only be
-    # fixed by recreating the arena.
+    # kept debug grant.  Its creation size (the random independent
+    # garrisons) can be too small, so the table is grown instead of forcing
+    # a recreation -- more records can simply be inserted before its
+    # 0xFFFFFFFF sentinel (see _grow_unit_table).
     required = len(src_specs) + 1 + len(enemy_specs) + 1 + len(keep_offs)
     if count < required:
-        raise ArenaCapacityError(
-            f'unit table holds {count} records, need {required} '
-            f'(own {len(src_specs)} + enemy {len(enemy_specs)} + 2 gods '
-            f'+ {len(keep_offs)} kept debug)', count, required)
+        count = _grow_unit_table(raw, base, stride, count, required - count)
+        print(f'  unit table grown to {count} records (armies need '
+              f'{required})')
 
     # The smaller army goes first: it keeps only the records it needs, and
     # the surplus records it owns are handed over to the other nation (the
@@ -4169,25 +4243,31 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         # the .trn, which is the turn-start snapshot (Bananas: the .trn has
         # -1 for every Bakemono-Sho that the .2h has already put in a squad).
         # Its squad ids are also the ones the com records above quote, so both
-        # sides of the assignment must come from the same file.
+        # sides of the assignment must come from the same file.  Units the
+        # .2h leaves without a squad are picked up by the rebalance pool
+        # below (31 Bird Knights and 36 War Birds of province 67, whose .trn
+        # squad is stale).
         h2_squad: dict[int, int] = {}
         if h2_raw:
             for r2 in trn_parse.unit_records(h2_raw):
                 h2_squad[r2['uid']] = struct.unpack_from(
                     '<I', h2_raw, r2['pos'] + 32)[0]
         stamped: dict[int, list[int]] = {}
+        stamp_of: dict[int, int] = {}
         for r in src_units:
             sq = h2_squad.get(r['uid'])
             if sq is None:                 # not in the orders file: use .trn
                 sq = struct.unpack_from('<I', src_raw, r['pos'] + 32)[0]
             if sq != 0xFFFFFFFF:
                 stamped.setdefault(sq, []).append(r['uid'])
+                stamp_of[r['uid']] = sq
         max_squad = 0
         for k in range(count):
             v = struct.unpack_from('<I', raw, base + k * stride + 28)[0]
             if v != 0xFFFFFFFF:
                 max_squad = max(max_squad, v)
         taken: set[int] = set()   # arena uids already assigned to a squad
+        undead_src_squads: set[int] = set()  # ... led by undead leadership
         h2_commanders: list[tuple[int, str, int, list[int], bytes]] = []
         # Every live source commander must receive a record.  Slots scrubbed
         # from replaced arena commanders are used first; _scrub_commanders
@@ -4211,24 +4291,34 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         #                from the same province, smallest first
         #        Part C — pri 2 only gets squads if literally none were taken
         #                by pri 0/1 (shouldn't happen for a healthy army)
-        def _try_assign_squad(sq_id: int, cmdr_prov: int) -> list[int]:
+        def _try_assign_squad(sq_id: int, cmdr_prov: int,
+                              budget: int | None = None
+                              ) -> tuple[int, list[int]]:
             """Try to assign a stamped squad to this commander's province.
 
-            Returns the list of chosen arena uids (may be empty), updates
-            ``taken``, increments ``max_squad``, and patches ``raw``.
+            Returns ``(squad id, arena uids)``, or ``(0, [])`` when nothing
+            was assigned.  ``budget`` caps how many members are taken, so a
+            commander never ends up over its leadership (see the rebalance
+            pass below).  Updates ``taken``, increments ``max_squad`` and
+            patches ``raw``.
             """
             members = [m for m in stamped.get(sq_id, [])
                        if m in arena_uid
                        and arena_uid[m] not in taken
                        and uid_at[m]['province'] == cmdr_prov]
+            if budget is not None:
+                members = members[:max(0, budget)]
             if not members:
-                return []
+                return 0, []
             # The .2h squad is copied as it is, mixed unit types included:
             # Hanif's squad 1337346 is 49 Bakemono-Sho + 1 O-bakemono, and
             # keeping only the majority type silently dropped the O-bakemono
             # from the formation.
             nonlocal max_squad
             max_squad += 1
+            donor = gamedata.units().get(cmdr_type)
+            if donor is not None and donor.undeadleader > donor.leader:
+                undead_src_squads.add(sq_id)
             chosen_auids = []
             for u in members:
                 a = arena_uid[u]
@@ -4236,7 +4326,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                 chosen_auids.append(a)
                 struct.pack_into('<I', raw, base + (a - 1) * stride + 28,
                                  max_squad)
-            return chosen_auids
+            return max_squad, chosen_auids
 
         # --- Phase 1: collect and sort commanders by priority ---
         cmdr_queue: list[tuple[int, dict, dict, list[int], int]] = []
@@ -4263,6 +4353,14 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         cmdr_queue.sort(key=lambda x: (x[0], -len(x[3])))
 
         # --- Phase 2: process each commander in priority order ---
+        def _capacity(unit_type: int) -> int:
+            """Units one commander may lead; the host enforces this at init."""
+            unit = gamedata.units().get(unit_type)
+            if unit is None:
+                return 0
+            return max(unit.leader, unit.undeadleader, unit.magicleader)
+
+        plans: list[dict] = []
         for pri, r, com, valid_slots, cmdr_prov in cmdr_queue:
             if not scrubbed:
                 raise RuntimeError(
@@ -4272,16 +4370,15 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             comid, c_start, c_uidpos = scrubbed.pop(0)
             auid = arena_uid[r['uid']]
             cmdr_type = r['type']
-            new_squads: list[tuple[int, int]] = []
-            n_members = 0
-            unit_name = gamedata.units().get(cmdr_type)
+            groups: list[tuple[int, list[int]]] = []
+            budget = _capacity(cmdr_type)
 
             # --- Part A: consume valid_slots (most certain) ---
             for sq in valid_slots:
-                assigned = _try_assign_squad(sq, cmdr_prov)
+                sid, assigned = _try_assign_squad(sq, cmdr_prov, budget)
                 if assigned:
-                    new_squads.append((max_squad, len(assigned)))
-                    n_members += len(assigned)
+                    groups.append((sid, assigned))
+                    budget -= len(assigned)
 
             # --- Part B (pri 0 & 1 only): leftover stamped squads same prov ---
             # Only take enough to reach the com record's original slot count.
@@ -4300,12 +4397,13 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                         key=lambda sq: len(stamped[sq])
                     )
                     for sq in leftover:
-                        if need <= 0:
+                        if need <= 0 or budget <= 0:
                             break
-                        assigned = _try_assign_squad(sq, cmdr_prov)
+                        sid, assigned = _try_assign_squad(sq, cmdr_prov,
+                                                          budget)
                         if assigned:
-                            new_squads.append((max_squad, len(assigned)))
-                            n_members += len(assigned)
+                            groups.append((sid, assigned))
+                            budget -= len(assigned)
                             need -= 1
 
             # --- Part C (pri 2 only): safety net — skip, this commander has
@@ -4320,19 +4418,87 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             # a commander's own unit record carries the no-squad marker
             struct.pack_into('<I', raw, base + (auid - 1) * stride + 28,
                              0xFFFFFFFF)
-            com_splices.append((c_start, c_uidpos + COM_BODY,
-                                _com_record(comid, com['name'], auid,
-                                            _squad_slots(new_squads),
-                                            bytes(tail))))
-            h2_commanders.append((comid, com['name'], auid,
-                                  _squad_slots(new_squads), bytes(tail)))
+            plans.append({'comid': comid, 'start': c_start, 'uidpos': c_uidpos,
+                          'auid': auid, 'com': com, 'prov': cmdr_prov,
+                          'type': cmdr_type, 'groups': groups,
+                          'tail': bytes(tail)})
             reserved.add(auid)
             if cmdr_counts.get(r['type'], 0) > 0:
                 cmdr_counts[r['type']] -= 1
-            print(f'  commander "{com["name"]}" '
-                  f'({unit_name.name if unit_name else cmdr_type}) kept as com '
-                  f'{comid}: {len(new_squads)} squad(s), {n_members} units, '
-                  f'name + orders copied')
+
+        # --- Leadership rebalance -------------------------------------------
+        # The host caps what one commander leads at its leadership value and
+        # silently drops the rest out of the squad: Ajakava (leader 100) kept
+        # 100 of 181 Soldier Priests and a Ghoul (leader 10 / undeadleader
+        # 50) kept 50 of 69, leaving hundreds of leaderless units.  The
+        # squads above only fill each commander up to its leadership, so the
+        # remaining formation members are handed to commanders of the same
+        # province that still have spare room.
+        pools: dict[int, list[int]] = {}
+        cmdr_auids = {plan['auid'] for plan in plans}
+        god_auid = arena_uid.get(god_uid) if god_uid is not None else None
+        for m, r in uid_at.items():
+            a = arena_uid.get(m)
+            if a is None or a in taken or a in cmdr_auids or a == god_auid:
+                continue
+            if r['province'] not in province_copy:
+                continue
+            # A squad an undead leader already took but could not fill up hit
+            # its undead leadership (the 40 extra Ghouls of two undeadleader
+            # 50 kings); no living commander may take them, and pooling would
+            # only let the host cut them again.  Living overflow (a squad of
+            # 181 Soldier Priests led by a leader 100) is pooled: another
+            # commander of the province can still lead it.
+            if stamp_of.get(m) in undead_src_squads:
+                continue
+            pools.setdefault(r['province'], []).append(a)
+        for prov, members in pools.items():
+            for plan in plans:
+                if not members:
+                    break
+                if plan['prov'] != prov:
+                    continue
+                room = (_capacity(plan['type'])
+                        - sum(len(a) for _, a in plan['groups']))
+                if room <= 0:
+                    continue
+                if len(plan['groups']) >= 5:
+                    # A fifth squad already sits in slot 0, the bodyguard
+                    # slot the host caps to 5 units; nothing can be added.
+                    continue
+                if plan['groups']:
+                    sid, auids = min(plan['groups'], key=lambda g: len(g[1]))
+                else:
+                    max_squad += 1
+                    sid, auids = max_squad, []
+                    plan['groups'].append((sid, auids))
+                take = members[:room]
+                del members[:room]
+                for a in take:
+                    auids.append(a)
+                    struct.pack_into('<I', raw, base + (a - 1) * stride + 28,
+                                     sid)
+                print(f'  leadership: {len(take)} unit(s) moved to '
+                      f'"{plan["com"]["name"]}" (province {prov})')
+
+        # Records are written after the rebalance so the com slots and the
+        # .2h carry the final squad ids.
+        for plan in plans:
+            slots = _squad_slots([(sid, len(a)) for sid, a in plan['groups']
+                                  if a])
+            com_splices.append(
+                (plan['start'], plan['uidpos'] + COM_BODY,
+                 _com_record(plan['comid'], plan['com']['name'], plan['auid'],
+                             slots, plan['tail'])))
+            h2_commanders.append((plan['comid'], plan['com']['name'],
+                                  plan['auid'], slots, plan['tail']))
+            n_members = sum(len(a) for _, a in plan['groups'])
+            n_squads = sum(1 for s in slots if s != 0xFFFFFFFF)
+            unit_name = gamedata.units().get(plan['type'])
+            print(f'  commander "{plan["com"]["name"]}" '
+                  f'({unit_name.name if unit_name else plan["type"]}) kept as '
+                  f'com {plan["comid"]}: {n_squads} squad(s), {n_members} '
+                  f'units, name + orders copied')
 
         # The client draws squad attachment and battle scripts from the
         # orders file, so the arena .2h gets the same records: the source
