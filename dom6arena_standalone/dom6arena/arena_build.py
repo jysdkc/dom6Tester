@@ -998,6 +998,48 @@ def _source_dir(arena: dict) -> Path:
     return config.saved_games_dir() / name
 
 
+def _own_nation_error(cfg: dict) -> str | None:
+    """Why ``arena.own_nation`` cannot be copied from this save, if it cannot.
+
+    Both the GUI and a hand written JSON reach :func:`main`, and the build
+    copies only the player's own ``.trn`` -- the file named after that
+    nation.  Another nation's turn file is deliberately ignored (it is
+    someone else's view and someone else's orders), so a mismatch has no
+    repair further down: it used to end in FileNotFoundError from
+    ``_player_trn``.  When every turn file in the save belongs to another
+    known nation the answer is simply "that nation is not in this save", and
+    that is what the console is told.  A file with a non-canonical name is
+    still left to the fallback scan in ``_player_trn``, which can find the
+    nation by its unit records.
+    """
+    arena = cfg.get('arena') or {}
+    explicit = int(arena.get('own_nation') or 0)
+    if not explicit:
+        return None                      # 0 = autodetect from the save
+    nation = gamedata.nations().get(explicit)
+    if nation is None:
+        return None                      # mod nation: nothing to compare
+    save_dir = _source_dir(arena)
+    if not save_dir.is_dir():
+        return None
+    if (save_dir / f'{nation.file_name_base}.trn').is_file():
+        return None
+    bases = {n.file_name_base: n for n in gamedata.nations().values()}
+    found = []
+    for trn in sorted(save_dir.glob('*.trn')):
+        other = bases.get(trn.stem)
+        if other is None:
+            return None                  # renamed/mod file: fallback decides
+        found.append(f'{_nation_text(other.id)} ({trn.name})')
+    return (f'ERROR: nation not found: arena.own_nation is '
+            f'{_nation_text(explicit)}, but save {save_dir.name!r} has no '
+            f'{nation.file_name_base}.trn; turn files found: '
+            f'{", ".join(found) or "none"}\n'
+            f'  only the own nation\'s .trn is copied -- set arena.own_nation '
+            f'to one of those ids, or copy from a save that holds '
+            f'{nation.file_name_base}.trn')
+
+
 def _source_army(save_dir: Path, nation: int, provinces: list[int]
                  ) -> tuple[bytes, list[int]]:
     """Army composition of the copied provinces.
@@ -1669,16 +1711,16 @@ def _check_start_terrain(map_path: Path,
 def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
                   enemy_nation: gamedata.Nation, mods: list[str],
                   map_name: str, player_start: int, enemy_start: int,
-                  recreate: bool = False, indepstr: int = 0) -> None:
+                  indepstr: int = 0) -> None:
     """Create the arena game with both nations as human players.
 
     The map is a fixed, hand made one: ``arena.map`` names a folder under
     ``maps/`` and is copied under the game name as-is, except that the capitals
     from ``player_start`` / ``enemy_start`` are pinned and every other surface
     province is made nonstartable (minus the few spare ones the engine's player
-    count check needs when a capital is underground).  ``recreate`` discards
-    the existing save and the staged copy first, so a changed source map is
-    picked up.
+    count check needs when a capital is underground).  An existing save and
+    its staged map copy are discarded first, so every run starts from a clean
+    arena (and a changed source map is picked up).
     """
     if not map_name:
         raise ValueError(
@@ -1693,13 +1735,12 @@ def _ensure_arena(game: str, era: int, player_nation: gamedata.Nation,
         )
     save = config.save_dir(game)
     staged = config.maps_dir() / game
-    if recreate:
-        if save.exists():
-            shutil.rmtree(save)
-            print(f'arena {game} discarded for recreation')
-        if staged.exists():
-            shutil.rmtree(staged)
-            print(f'map {staged.name} discarded for recreation')
+    if save.exists():
+        shutil.rmtree(save)
+        print(f'arena {game} discarded for recreation')
+    if staged.exists():
+        shutil.rmtree(staged)
+        print(f'map {staged.name} discarded for recreation')
     staged_map = staged / f'{game}.map'
     if not staged_map.exists():
         _copy_fixed_map(game, map_name)
@@ -3532,21 +3573,18 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                          if enemy_extra_start_at else len(enemy_comp))
     print(f'enemy army: {len(enemy_comp)} units')
 
-    # ---- create / reuse the arena ---------------------------------------
-    recreate = bool(arena.get('recreate'))
-    fresh = recreate or not (config.save_dir(game) / 'ftherlnd').exists()
+    # ---- create the arena -----------------------------------------------
     _ensure_arena(game, era, player_nat, enemy_nation, mods,
                   map_name=str(arena.get('map') or '').strip(),
                   player_start=int(player_cfg.get('start_province') or 1),
                   enemy_start=int(enemy_cfg.get('start_province') or 5),
-                  recreate=recreate, indepstr=indepstr)
+                  indepstr=indepstr)
 
     save = config.save_dir(game)
     ft = save / 'ftherlnd'
     backup = config.OUTPUT_DIR / f'{game}_ftherlnd_before_swap.bin'
-    if fresh or not backup.exists():
-        shutil.copyfile(ft, backup)
-        print(f'NOTE: {backup.name} refreshed from the new ftherlnd')
+    shutil.copyfile(ft, backup)
+    print(f'NOTE: {backup.name} refreshed from the new ftherlnd')
     shutil.copyfile(backup, ft)
     raw = bytearray(ft.read_bytes())
     # World unit-id -> nation of THIS arena game, read once from the fresh
@@ -5107,8 +5145,14 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
             pass
     cfg_path = Path(config_path)
     cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+    # A nation that is not in the source save cannot be copied from it; stop
+    # with that sentence instead of the FileNotFoundError the build would
+    # raise three steps later.
+    missing = _own_nation_error(cfg)
+    if missing:
+        raise SystemExit(missing)
     from collections import Counter
-    tries = attempts if cfg.get('host', True) else 1
+    tries = attempts
     indepstr = 0
     last_count = -1
     for attempt in range(1, tries + 1):
@@ -5133,7 +5177,6 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
             indepstr = nxt
             print(f'  recreating the arena and retrying '
                   f'(attempt {attempt}/{tries}, indepstr {indepstr})')
-            cfg = {**cfg, 'arena': {**cfg['arena'], 'recreate': True}}
             continue
         raw = config.save_dir(result['game']).joinpath('ftherlnd').read_bytes()
         pp = result['player_province']
@@ -5147,8 +5190,6 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
               f"(army {len(result['enemy_composition'])} + pretender)")
         print(f"  counts: {sorted(Counter(epgot).items())}")
 
-        if not cfg.get('host', True):
-            return result
         log, over = newgame.host_once(result['game'], timeout=180.0,
                                       mods=cfg.get('mods') or [])
         print('game_over:', over)
@@ -5183,7 +5224,6 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
         if attempt < tries:
             print(f'  host did not advance (attempt {attempt}/{tries}); '
                   f'recreating the arena and retrying')
-            cfg = {**cfg, 'arena': {**cfg['arena'], 'recreate': True}}
     raise RuntimeError(f'{result["game"]}: host failed {tries} times')
 
 
