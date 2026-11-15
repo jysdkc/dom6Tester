@@ -29,7 +29,14 @@ player.provinces 这个是拷贝省份兵力，敌人就是从侦察报告，如
 player.extra_units 这个是添加自定义单位，具体见配置文件注释。默认不用配。
 
 ## 运行
-windows控制台进入到dom6arena_standalone目录中，输入：
+
+windows控制台进入到dom6arena_standalone目录中
+
+启动gui：
+
+python -m dom6arena.arena_gui
+
+从配置文件启动
 
 python -m dom6arena.arena_build "arena_config.json"
 
