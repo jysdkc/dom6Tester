@@ -804,7 +804,8 @@ def unit_records(raw: bytes) -> list[dict]:
     misses real records that sit behind a shadow record; byte-step is
     slower but correct.
     """
-    found: dict[int, dict] = {}
+    candidates: dict[int, list[dict]] = {}
+    alignments: Counter = Counter()
     pos = 0
     while pos < len(raw) - TRN_STRIDE:
         if not _looks_like_record(raw, pos):
@@ -816,7 +817,7 @@ def unit_records(raw: bytes) -> list[dict]:
             # Shadow or garbage record — skip.
             pos += 1
             continue
-        found.setdefault(uid, {
+        candidates.setdefault(uid, []).append({
             "pos": pos,
             "uid": uid,
             "type": struct.unpack_from("<H", raw, pos + 36)[0],
@@ -825,8 +826,24 @@ def unit_records(raw: bytes) -> list[dict]:
             "origin": struct.unpack_from("<H", raw, pos + 42)[0],
             "nation": nation,
         })
+        alignments[pos % TRN_STRIDE] += 1
         pos += 1  # byte-step — don't jump stride, real records may be sparse
-    return list(found.values())
+    # A false candidate can have the same uid as a real unit while pointing
+    # into an unrelated block (nation 0 is common).  Keeping the first hit
+    # then hides the real unit: Bananas uid 1558/1561 lost two Dai Bakemono.
+    # Real unit tables and VCR snapshots contain many records at one alignment
+    # modulo TRN_STRIDE.  Prefer a candidate with a real owner over the nation-0
+    # shadow blocks, then keep the first one in a packed alignment.  Do not
+    # compare alignment counts themselves: a large VCR can outnumber the current
+    # unit table, but its later snapshot must not replace the current record.
+    # All-neutral records retain their original order, so independents and
+    # neutral battle reports behave exactly as before.
+    def pick(records: list[dict]) -> dict:
+        owned = [r for r in records if r["nation"] != 0]
+        pool = owned or records
+        return next((r for r in pool
+                     if alignments[r["pos"] % TRN_STRIDE] > 1), pool[0])
+    return [pick(records) for records in candidates.values()]
 
 
 def province_units(raw: bytes, province: int, nation: int | None = None,

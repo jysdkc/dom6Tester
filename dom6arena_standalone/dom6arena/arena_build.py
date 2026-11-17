@@ -607,17 +607,21 @@ def _retag_trn_god(buf: bytearray, god_name: str, god_type: int,
 #     [181 byte tail: items, magic paths, battle orders]
 # Tail fields that reference the world and therefore need remapping:
 #     +92  u32 province the commander is in (0 when none)
+#     +112 5 x u16 personal spell script (verified by engine spell validation)
 #     +126 u32 unit id of one of the commander's own units
 #     +140 u8  the commander's order/status code, dropped on transplant
 #     +141 8 x u8 carried gems (F,A,W,E,S,D,N,B) -- copied verbatim
+#     +152 29 bytes of squad layouts/orders
 # --------------------------------------------------------------------------
 COM_BODY = 205          # unit id (4) + squad slots (20) + tail (181)
 COM_TAIL = 181
 T_PROV = 92
+T_SPELL_SCRIPTS = 112   # five u16 spell ids; 0 = empty, fffd = no spell order
+T_SPELL_SCRIPTS_END = T_SPELL_SCRIPTS + 10
 T_UIDREF = 126
 T_PATHS = 130           # ten bytes: F,A,W,E,S,D,N,G,B,H
 T_ORDER = 140           # one byte; +141 starts the eight gem counts
-T_SQUAD_LAYOUT = 152    # 29 bytes: copied squad layout (ftherlnd) / scripts (.2h)
+T_SQUAD_LAYOUT = 152    # 29 bytes: squad layouts and squad battle orders
 PATH_LETTERS = 'FAWESDNGBH'
 
 
@@ -698,12 +702,37 @@ def _trn_commander(raw: bytes, uid: int) -> dict | None:
                 return {'comid': struct.unpack_from('<I', raw,
                                                     name_start - 4)[0],
                         'name': name, 'uid': uid,
+                        'slots': list(squads),
                         'squads': [v for v in squads if v != 0xFFFFFFFF],
                         'tail': bytes(tail),
                         'start': name_start - 4,
                         'end': pos + 5 + COM_BODY - 4}
         pos = raw.find(pat, pos + 1)
     return None
+
+
+def _restore_spell_scripts(buf: bytearray, scripts: dict[int, bytes]) -> int:
+    """Restore the five personal spell slots by arena unit id.
+
+    The first host can reject and clear a legal scripted spell while the new
+    game's spell state is being initialized.  The orders file retains the
+    copied script, but the client reads the regenerated .trn, where those five
+    slots have become zero.  Copy only these ten bytes back after hosting;
+    squad layouts, squad orders, equipment and every other field stay as the
+    engine wrote them.
+    """
+    restored = 0
+    for uid, script in scripts.items():
+        if len(script) != T_SPELL_SCRIPTS_END - T_SPELL_SCRIPTS:
+            continue
+        com = _trn_commander(buf, uid)
+        if com is None:
+            continue
+        pos = com['end'] - COM_TAIL + T_SPELL_SCRIPTS
+        if buf[pos:pos + len(script)] != script:
+            buf[pos:pos + len(script)] = script
+            restored += 1
+    return restored
 
 
 def _source_com(h2_raw: bytes | None, trn_raw: bytes, uid: int
@@ -809,18 +838,52 @@ def _sanitize_items(tail: bytearray, who: str) -> bytearray:
     return tail
 
 
-def _squad_slots(squads: list[tuple[int, int]]) -> list[int]:
-    """Squad ids laid out in a com record's five slot fields.
+def _squad_slots(groups: list[tuple[int, list[int], int | None]],
+                 source_slots: list[int]) -> list[int]:
+    """Lay out new squad ids in the source commander's original five slots.
 
-    The host treats slot 0 as the commander's bodyguard squad and caps it to
-    the commander's bodyguard limit (5 units for a mounted commander such as
-    the Bird Knight Commander).  A copied 79-unit squad placed there comes
-    out of the first host as one 5-unit squad plus 74 leaderless units.
-    Slot 0 is optional, so it stays empty and the squads go to slots 1..4;
-    only a fifth squad has to use it, and then the smallest one does.
+    ``groups`` holds ``(new squad id, members, source squad id)``.  A new id
+    replaces its source id in exactly the same slot; empty source slots stay
+    empty unless leadership rebalancing created an additional squad.  The
+    29-byte squad layout/order block is indexed by these slots, so sorting
+    squads by size or inserting a leading empty slot attaches squad orders to
+    the wrong squads.
+
+    Slot 0 is the bodyguard slot.  It keeps a source squad that already used
+    it, but an additional squad only goes there when all five slots are
+    needed; in that case the smallest squad is used to avoid the host's
+    bodyguard-size cap.  Other additional squads fill free slots 1..4 in
+    their original order.
     """
-    ids = [s for s, _ in sorted(squads, key=lambda kv: kv[1])[:5]]
-    return ids if len(ids) == 5 else [0xFFFFFFFF] + ids
+    empty = 0xFFFFFFFF
+    slots = [empty] * 5
+    pending: list[tuple[int, int]] = []
+    entries = [(sid, len(members), source_sq)
+               for sid, members, source_sq in groups if members]
+    if len(entries) > 5:
+        raise ValueError(f'a commander has {len(entries)} squads (maximum 5)')
+    for sid, size, source_sq in entries:
+        try:
+            index = source_slots.index(source_sq) if source_sq is not None else -1
+        except ValueError:
+            index = -1
+        if index >= 0 and slots[index] == empty:
+            slots[index] = sid
+        else:
+            pending.append((sid, size))
+    if len(entries) == 5 and slots[0] == empty:
+        bodyguard = min(entries, key=lambda entry: entry[1])[0]
+        if bodyguard in slots:
+            slots[slots.index(bodyguard)] = empty
+        else:
+            pending = [entry for entry in pending if entry[0] != bodyguard]
+        slots[0] = bodyguard
+    free = [i for i in range(1, 5) if slots[i] == empty]
+    if len(pending) > len(free):
+        raise ValueError('could not preserve commander squad slots')
+    for index, (sid, _) in zip(free, pending):
+        slots[index] = sid
+    return slots
 
 
 def _com_record(comid: int, name: str, uid: int, squads: list[int],
@@ -840,18 +903,13 @@ def _com_record(comid: int, name: str, uid: int, squads: list[int],
     earlier u32 clear at +140 silently wiped the fire/air/water gems.
     Items, magic paths, gems and battle scripts are kept as copied.
 
-    ``keep_layout=False`` clears the image's copy of the 29 byte per-squad
-    block at ``tail + 152``.  In ftherlnd that block still describes the
-    *source* province's squads -- including which slot held its bodyguard
-    squad -- and the host re-applies it on init: a copied squad that now
-    sits in a slot the source used for bodyguards is cut down to the
-    bodyguard limit (5 units for a mounted commander), so 18 of Aitareya's
-    23 Bird Knights came out leaderless even though the squad occupied
-    slot 1 with its full size.  The arena is a new map, so the copied
-    layout is meaningless and blanking it lets the host lay the squads out
-    from scratch with their full size.  The orders file copy must keep it
-    (``keep_layout=True``): there the same bytes carry the battle scripts
-    the client and the host read.
+    ``keep_layout=False`` clears the 29-byte per-squad block at ``tail + 152``.
+    Live copied commanders must use ``keep_layout=True`` in both ftherlnd and
+    the orders file: the host reads this block when regenerating the .trn, and
+    clearing it loses their squad layouts/orders.  Their new squad ids are written
+    into the original slot positions by ``_squad_slots``, so the layout still
+    describes the same formation and cannot reapply a bodyguard layout to a
+    different squad.  Dead commander records are still scrubbed separately.
     """
     slots = (list(squads) + [0xFFFFFFFF] * 5)[:5]
     body = bytearray(tail)
@@ -1038,33 +1096,6 @@ def _own_nation_error(cfg: dict) -> str | None:
             f'  only the own nation\'s .trn is copied -- set arena.own_nation '
             f'to one of those ids, or copy from a save that holds '
             f'{nation.file_name_base}.trn')
-
-
-def _source_army(save_dir: Path, nation: int, provinces: list[int]
-                 ) -> tuple[bytes, list[int]]:
-    """Army composition of the copied provinces.
-
-    Only the player's OWN .trn is read (matched by nation id ->
-    file_name_base, same as the bananas PBEM save).  A hotseat save's
-    ``ftherlnd`` is a *world* state whose province lists hold every
-    nation's units, and another player's .trn shows our pretender scrubbed
-    (zeroed bless, no live design block); neither is ever used.
-
-    Units are selected by the province they are **in** now (+40), not by
-    their origin (+42, where they started the turn).  The user's
-    ``player.provinces`` means "the army standing in these provinces"; an
-    origin filter would also drag along everything that marched out of them
-    (a save where 61 units left province 199 for 176 copied 100 units for a
-    province holding 15).
-    """
-    trn_path, raw = _player_trn(save_dir, nation)
-    wanted = set(provinces)
-    comp = [r['type'] for r in trn_parse.current_unit_records(raw)
-            if r['nation'] == nation and r['province'] in wanted]
-    if not comp:
-        raise ValueError(_no_army_message(trn_path, save_dir, nation,
-                                          provinces))
-    return raw, comp
 
 
 def _no_army_message(trn_path: Path, save_dir: Path, nation: int,
@@ -1966,6 +1997,7 @@ def _battle_com_candidates(raw: bytes, rep: dict) -> list[dict]:
                                 '<I', raw, record_start)[0],
                             'name': name,
                             'uid': uid,
+                            'slots': list(slots),
                             'squads': [s for s in slots
                                        if s != 0xFFFFFFFF],
                             'tail': tail,
@@ -2310,8 +2342,11 @@ def _scan_vcr_snapshots(raw: bytes, vcr_start: int, bcd_start: int,
     see, so the VCR is the *only* source for squad ids and uid/type pairs
     of unseen enemy units.
 
-    Returns ``{uid: {'type': int, 'squad': int, 'province': int, 'hp': int}}``
-    for every snapshot matching ``nation``.
+    Returns ``{uid: {'type': int, 'squad': int, 'province': int, 'hp': int,
+    'master': int, 'rider': int}}`` for every snapshot matching ``nation``.
+    ``master`` is the 4-byte link at ``+81`` (positive = this record is a
+    mount pointing at its rider's uid, ``-2`` = a rider) and ``rider`` is the
+    ``0x80`` bit of ``+25``; both are needed to rebuild a mounted pair.
     """
     out: dict[int, dict] = {}
     seg = raw[vcr_start:bcd_start]
@@ -2331,7 +2366,9 @@ def _scan_vcr_snapshots(raw: bytes, vcr_start: int, bcd_start: int,
                 and 1 <= prov <= 5000
                 and nat == nation):
             out[uid] = {'type': typ, 'squad': sq, 'province': prov,
-                        'hp': struct.unpack_from('<H', seg, pos + 34)[0]}
+                        'hp': struct.unpack_from('<H', seg, pos + 34)[0],
+                        'master': struct.unpack_from('<i', seg, pos + 81)[0],
+                        'rider': 1 if (seg[pos + 25] & 0x80) else 0}
         pos += 1
     return out
 
@@ -2983,6 +3020,14 @@ def _scrub_commanders(raw: bytearray, base: int, stride: int, count: int,
             # "bad equip" even for this dead one.
             _dead = bytearray(raw[uidpos + 24:rec_end])
             _sanitize_items(_dead, f'scrubbed com {comid}')
+            # The 29-byte squad-layout block at tail+152 still describes the
+            # source province's squads and may reference unit ids that have
+            # since been reused for ordinary troops (e.g. a Shadow Steed
+            # mount whose slot now holds a Dai Bakemono).  The host applies
+            # the layout on init even for dead com records and removes the
+            # mismatched unit.  Blank it just like _com_record(keep_layout
+            # =False) does for transplanted commanders.
+            _dead[T_SQUAD_LAYOUT:] = bytes(COM_TAIL - T_SQUAD_LAYOUT)
             raw[uidpos + 24:rec_end] = _dead
             # A dead slot (comid -1) stays dead: handing its comid out to a
             # transplanted commander makes the host abort (observed: Afe
@@ -2991,6 +3036,15 @@ def _scrub_commanders(raw: bytearray, base: int, stride: int, count: int,
             # below.
             if comid < 0x80000000:
                 scrubbed.append((comid, pos, uidpos))
+        elif unitid <= 0:
+            # An already-dead com record (unitid 0 or -1) was never rewired
+            # by the build, but its squad-layout block can still carry stale
+            # unit references from the fresh arena (e.g. Zarkomand's record
+            # pointing at uid 6).  Clear the layout so the host does not
+            # recycle or delete a unit it no longer owns.
+            _dead = bytearray(raw[uidpos + 24:rec_end])
+            _dead[T_SQUAD_LAYOUT:] = bytes(COM_TAIL - T_SQUAD_LAYOUT)
+            raw[uidpos + 24:rec_end] = _dead
         pos = rec_end
         seen += 1
     if pos < limit:
@@ -3256,6 +3310,16 @@ def _write_nation_army(raw: bytearray, base: int, stride: int, count: int,
     for off in [god_off] + slots:
         struct.pack_into('<HH', raw, off + 36, province, province)
 
+    # Squad attachment (+28).  A slot is usually borrowed from the arena's old
+    # garrison and keeps that garrison's squad id: the squad belongs to another
+    # nation and is removed as empty at init, so every unit still pointing at
+    # it is dropped ("***** removed ... dead squads") and never reaches the
+    # .trn -- observed with 836 copied units of which only 43 survived.  Start
+    # every copied unit unassigned and let the commander transplant stamp the
+    # new squad ids afterwards.
+    for off in slots:
+        struct.pack_into('<I', raw, off + 28, 0xFFFFFFFF)
+
     # Creation leaves surplus records empty (nat/prov 0xffff) with the i32
     # alive marker at +66 set to 0; every live record has -1 there (verified
     # on the full table).  Reusing an empty slot without restoring the
@@ -3465,8 +3529,11 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # Only the player's own files are ever read: ftherlnd is the world
     # state of a hotseat save (every nation's units) and another player's
     # .trn/.2h shows a scrubbed view of our side.
-    src_raw, _ = _source_army(save_dir, source_nation, provinces)
+    # The current-garrison check waits until the battle-report picks are known:
+    # a province whose army is already gone only exists in its report, and the
+    # report is a valid source on its own (see province_copy below).
     trn_path, trn_raw = _player_trn(save_dir, source_nation)
+    src_raw = trn_raw
     # The player's orders file: fresher com records (battle scripts), and
     # the proof of which commanders are alive this turn.
     h2_path = trn_path.with_suffix('.2h')
@@ -3497,6 +3564,11 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # the records standing in the requested provinces.
     src_units: list[dict] = _province_records(src_raw, province_copy,
                                               source_nation)
+    if not src_units and not player_report_entries:
+        # Neither a current garrison nor a picked report: the configured
+        # provinces hold nothing of ours.
+        raise ValueError(_no_army_message(trn_path, save_dir, source_nation,
+                                          provinces))
     units_raw = src_raw
     print(f'  unit source: {trn_path.name} '
           f'({len(src_units)} unit(s) of nation {source_nation} '
@@ -4056,14 +4128,63 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # battle are part of it too.
     player_report_records: list[dict] = []
     player_report_count = 0
+    # Report units are appended as one block; the commander/squad mapping
+    # below addresses them as ``player_report_start + report_index``.  Mounts
+    # are appended after the block, so the start index is kept instead of
+    # recomputed from the list length.
+    player_report_start = len(src_specs)
     for unit_type, detail in zip(player_report_units, player_report_detail):
         if unit_type == god_type and not player_override_chassis:
             continue
         local_index = player_report_count
-        src_specs.append({'type': unit_type, 'hp': (detail or {}).get('hp')})
+        src_specs.append({'type': unit_type,
+                          'hp': (detail or {}).get('hp'),
+                          'src_uid': (detail or {}).get('uid')})
         player_report_count += 1
         if detail is not None:
             player_report_records.append({**detail, 'report_index': local_index})
+
+    # Mounts ridden by the copied report units.  The report's start list holds
+    # riders only (the province screen counts 828 for a battle whose VCR has
+    # 903 records), so a rider would otherwise be copied bare: Bird Knights
+    # lost their War Birds and Heavy Cavalry their Destriers.  Each mount is a
+    # VCR record whose ``master`` points at its rider's uid; append it with
+    # that source uid so _apply_master_chain rewrites the link, and flag the
+    # rider ``master = -2`` / ``+25:0x80`` exactly like the engine does.
+    report_uids = {r['uid'] for r in player_report_records}
+    added_mounts: set[int] = set()
+    for entry in player_report_entries:
+        prov = int(entry['province'])
+        side = entry['copy']
+        rep = [r for r in trn_parse.battle_reports(trn_raw, prov)
+               if (side == 'attacker'
+                   and r['attacker'] == entry.get('attacker'))
+               or (side == 'defender'
+                   and r['defender'] == entry.get('defender'))]
+        if not rep:
+            continue
+        rep = rep[entry['seq']] if 'seq' in entry and entry['seq'] < len(rep) \
+            else rep[0]
+        snaps = _scan_vcr_snapshots(trn_raw, rep['vcr'], rep['bcd'],
+                                    rep[side])
+        for uid, info in snaps.items():
+            if uid in report_uids or uid in added_mounts:
+                continue
+            if not 0 < info.get('master', -1) or info['master'] not in report_uids:
+                continue
+            added_mounts.add(uid)
+            src_specs.append({'type': info['type'], 'hp': info['hp'],
+                              'src_uid': uid, 'master': info['master'],
+                              'rider': 0})
+    if added_mounts:
+        masters = {spec['master'] for spec in src_specs[player_report_start:]
+                   if spec.get('master', -1) > 0}
+        for spec in src_specs[player_report_start:]:
+            if spec.get('src_uid') in masters:
+                spec['master'] = -2           # rider: engine's own marker
+                spec['rider'] = 1
+        print(f'  player battle report: {len(added_mounts)} mount(s) '
+              f'copied with {len(masters)} rider(s)')
     player_report_expected_cmdrs = sum(
         1 for r in player_report_records
         if r.get('com') is not None
@@ -4408,14 +4529,14 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             comid, c_start, c_uidpos = scrubbed.pop(0)
             auid = arena_uid[r['uid']]
             cmdr_type = r['type']
-            groups: list[tuple[int, list[int]]] = []
+            groups: list[tuple[int, list[int], int | None]] = []
             budget = _capacity(cmdr_type)
 
             # --- Part A: consume valid_slots (most certain) ---
             for sq in valid_slots:
                 sid, assigned = _try_assign_squad(sq, cmdr_prov, budget)
                 if assigned:
-                    groups.append((sid, assigned))
+                    groups.append((sid, assigned, sq))
                     budget -= len(assigned)
 
             # --- Part B (pri 0 & 1 only): leftover stamped squads same prov ---
@@ -4440,7 +4561,8 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                         sid, assigned = _try_assign_squad(sq, cmdr_prov,
                                                           budget)
                         if assigned:
-                            groups.append((sid, assigned))
+                            groups.append((sid, assigned,
+                                           sq if sq in com['slots'] else None))
                             budget -= len(assigned)
                             need -= 1
 
@@ -4497,7 +4619,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                 if plan['prov'] != prov:
                     continue
                 room = (_capacity(plan['type'])
-                        - sum(len(a) for _, a in plan['groups']))
+                        - sum(len(a) for _, a, _ in plan['groups']))
                 if room <= 0:
                     continue
                 if len(plan['groups']) >= 5:
@@ -4505,11 +4627,12 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                     # slot the host caps to 5 units; nothing can be added.
                     continue
                 if plan['groups']:
-                    sid, auids = min(plan['groups'], key=lambda g: len(g[1]))
+                    sid, auids, _ = min(plan['groups'],
+                                        key=lambda g: len(g[1]))
                 else:
                     max_squad += 1
                     sid, auids = max_squad, []
-                    plan['groups'].append((sid, auids))
+                    plan['groups'].append((sid, auids, None))
                 take = members[:room]
                 del members[:room]
                 for a in take:
@@ -4522,15 +4645,14 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         # Records are written after the rebalance so the com slots and the
         # .2h carry the final squad ids.
         for plan in plans:
-            slots = _squad_slots([(sid, len(a)) for sid, a in plan['groups']
-                                  if a])
+            slots = _squad_slots(plan['groups'], plan['com']['slots'])
             com_splices.append(
                 (plan['start'], plan['uidpos'] + COM_BODY,
                  _com_record(plan['comid'], plan['com']['name'], plan['auid'],
-                             slots, plan['tail'])))
+                             slots, plan['tail'], keep_layout=True)))
             h2_commanders.append((plan['comid'], plan['com']['name'],
                                   plan['auid'], slots, plan['tail']))
-            n_members = sum(len(a) for _, a in plan['groups'])
+            n_members = sum(len(a) for _, a, _ in plan['groups'])
             n_squads = sum(1 for s in slots if s != 0xFFFFFFFF)
             unit_name = gamedata.units().get(plan['type'])
             print(f'  commander "{plan["com"]["name"]}" '
@@ -4658,23 +4780,23 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             # Plan the squads first; a com leading no unit would attach
             # equipment to an empty leader, which the host rejects with
             # "bad equip".
-            plan: list[list[int]] = []
+            plan: list[tuple[int, list[int]]] = []
             for sq in com['squads']:
                 members = [u for u in stamped.get(sq, [])
                            if u in report_uid and report_uid[u] not in taken]
                 if not members:
                     continue
-                plan.append(members)
+                plan.append((sq, members))
                 for u in members:
                     taken.add(report_uid[u])
-            n_members = sum(len(m) for m in plan)
+            n_members = sum(len(members) for _, members in plan)
             if not scrubbed:
                 raise RuntimeError(
                     f'ran out of freed com slots before enemy commander '
                     f'uid {r["uid"]} (type {r["type"]})')
             comid, c_start, c_uidpos = scrubbed.pop(0)
             new_squads: list[int] = []
-            for chosen in plan:
+            for source_sq, chosen in plan:
                 max_squad += 1
                 new_squads.append(max_squad)
                 for u in chosen:
@@ -4689,7 +4811,10 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                                  report_uid.get(struct.unpack_from('<I', tail, T_UIDREF)[0], 0))
             struct.pack_into('<I', raw, base + (auid - 1) * stride + 28,
                              0xFFFFFFFF)
-            slots = _squad_slots(list(zip(new_squads, map(len, plan))))
+            slots = _squad_slots(
+                [(sid, members, source_sq)
+                 for sid, (source_sq, members) in zip(new_squads, plan)],
+                com['slots'])
             com_splices.append((c_start, c_uidpos + COM_BODY,
                                 _com_record(comid, com['name'], auid,
                                             slots, bytes(tail),
@@ -4784,7 +4909,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             struct.pack_into('<I', tail, T_UIDREF, arena_uid[ref])
         com_splices.append((c_start, c_uidpos + COM_BODY,
                             _com_record(comid, name, e_god_uid, [],
-                                        bytes(tail))))
+                                        bytes(tail), keep_layout=False)))
         print(f'  enemy pretender com record copied from the battle report '
               f'("{name}")')
     elif enemy_god_paths is not None:
@@ -4864,7 +4989,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             # fallback can pick up bytes in front of a lowercase name.
             com_splices.append((c_start, c_uidpos + COM_BODY,
                                 _com_record(comid, src_name, p_god_uid,
-                                            [], bytes(tail))))
+                                            [], bytes(tail), keep_layout=False)))
             print(f'  player pretender com record copied from '
                   f'{"the battle report" if player_god_com is not None else "source save"} '
                   f'("{src_name}")')
@@ -4874,7 +4999,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # player's own .trn.  Mirror the enemy transplant above so a province
     # read from a battle report keeps its commanders armed.
     if player_report_records and scrubbed:
-        report_start = len(src_specs) - player_report_count
+        report_start = player_report_start
         slots_by_index = {i: off
                           for i, off in enumerate(p_used[1:1 + len(src_specs)])}
         report_uid: dict[int, int] = {}
@@ -4951,23 +5076,23 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             # Plan the squads this commander leads WITHOUT touching state yet.
             # A com that leads no unit would attach equipment to an empty
             # leader -- exactly what the host rejects as "bad equip".
-            plan: list[list[int]] = []
+            plan: list[tuple[int, list[int]]] = []
             for sq in com['squads']:
                 members = [u for u in stamped.get(sq, [])
                            if u in report_uid and report_uid[u] not in taken]
                 if not members:
                     continue
-                plan.append(members)
+                plan.append((sq, members))
                 for u in members:
                     taken.add(report_uid[u])
-            n_members = sum(len(m) for m in plan)
+            n_members = sum(len(members) for _, members in plan)
             if not scrubbed:
                 raise RuntimeError(
                     f'ran out of freed com slots before player commander '
                     f'uid {r["uid"]} (type {r["type"]})')
             comid, c_start, c_uidpos = scrubbed.pop(0)
             new_squads: list[int] = []
-            for chosen in plan:
+            for source_sq, chosen in plan:
                 max_squad += 1
                 new_squads.append(max_squad)
                 for u in chosen:
@@ -4984,10 +5109,14 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                                    0))
             struct.pack_into('<I', raw, base + (auid - 1) * stride + 28,
                              0xFFFFFFFF)
-            slots = _squad_slots(list(zip(new_squads, map(len, plan))))
+            slots = _squad_slots(
+                [(sid, members, source_sq)
+                 for sid, (source_sq, members) in zip(new_squads, plan)],
+                com['slots'])
             com_splices.append((c_start, c_uidpos + COM_BODY,
                                 _com_record(comid, com['name'], auid,
-                                            slots, bytes(tail))))
+                                            slots, bytes(tail),
+                                            keep_layout=True)))
             reserved.add(auid)
             extra_h2['player'].append(
                 (comid, com['name'], auid, slots, bytes(tail)))
@@ -5071,15 +5200,48 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     # does not match, so it is rewritten last.
     god_types = {own_nation: god_type, enemy_nation.id: enemy_god_type}
 
+    # The arena orders files are the post-transplant source of truth for the
+    # five personal spell slots.  Index them by the arena's final unit ids so
+    # the same restoration works for province, scout and battle-report copies.
+    spell_scripts: dict[int, dict[int, bytes]] = {}
+    final_uid_nation = _uid_nation_map(bytes(raw))
+    for arena_nation in god_types:
+        orders_path = save / (
+            gamedata.nations()[arena_nation].file_name_base + '.2h')
+        if not orders_path.exists():
+            continue
+        orders = orders_path.read_bytes()
+        scripts: dict[int, bytes] = {}
+        for uid, owner in final_uid_nation.items():
+            if owner != arena_nation:
+                continue
+            com = _trn_commander(orders, uid)
+            if com is not None and len(com['tail']) == COM_TAIL:
+                scripts[uid] = com['tail'][
+                    T_SPELL_SCRIPTS:T_SPELL_SCRIPTS_END]
+        spell_scripts[arena_nation] = scripts
+    world_spell_scripts = {
+        uid: script for scripts in spell_scripts.values()
+        for uid, script in scripts.items()}
+    turn_spell_scripts = {
+        gamedata.nations()[nation].file_name_base + '.trn': scripts
+        for nation, scripts in spell_scripts.items()}
+
     def _patch_turn_files() -> None:
-        """Re-apply the design transplant to ftherlnd and every turn file."""
+        """Re-apply designs and personal spell scripts after every host."""
         world = save / 'ftherlnd'
         data = world.read_bytes()
         buf = _transplant(bytearray(data), arena_uid_nation)
+        design_changed = bytes(buf) != data
+        restored = _restore_spell_scripts(buf, world_spell_scripts)
         if bytes(buf) != data:
             world.write_bytes(bytes(buf))
+        if design_changed:
             print(f'  pretender design written into {world.name} '
                   f'(after host)')
+        if restored:
+            print(f'  restored {restored} commander spell script(s) in '
+                  f'{world.name}')
         for trn in sorted(save.glob('*.trn')):
             data = trn.read_bytes()
             buf = _transplant(bytearray(data), arena_uid_nation)
@@ -5094,17 +5256,17 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
                 if changed:
                     print(f'  pretender unit type {chosen} set in {trn.name} '
                           f'({changed} record(s))')
+            restored = _restore_spell_scripts(
+                buf, turn_spell_scripts.get(trn.name, {}))
             fixed = savecrc.fix(bytes(buf))
             if fixed != data:
                 trn.write_bytes(fixed)
                 print(f'  pretender design written into {trn.name}')
+            if restored:
+                print(f'  restored {restored} commander spell script(s) in '
+                      f'{trn.name}')
 
     _patch_turn_files()
-
-    # ---- copy current player scripts (.2h) ------------------------------
-    # Scripts (battle orders) live in ftherlnd's pretender design record,
-    # which was already transplanted from the source save.
-    print('scripts already in ftherlnd (from pretender design transplant)')
 
     return {
         'game': game,
@@ -5115,7 +5277,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         'enemy_province': enemy_prov,
         'player_composition': src_types,
         'enemy_composition': [s['type'] for s in enemy_specs],
-        # Re-applies the design transplant after a host (see _patch_turn_files).
+        # Re-applies designs and personal spell scripts after a host.
         'patch_turn_files': _patch_turn_files,
     }
 
