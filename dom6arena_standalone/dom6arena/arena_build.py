@@ -25,7 +25,7 @@ import random
 import shutil
 import struct
 import sys
-from collections import Counter, deque
+from collections import deque
 from pathlib import Path
 
 if __package__ in (None, ''):
@@ -1096,39 +1096,6 @@ def _own_nation_error(cfg: dict) -> str | None:
             f'  only the own nation\'s .trn is copied -- set arena.own_nation '
             f'to one of those ids, or copy from a save that holds '
             f'{nation.file_name_base}.trn')
-
-
-def _no_army_message(trn_path: Path, save_dir: Path, nation: int,
-                     provinces: list[int]) -> str:
-    """A "nothing in these provinces" error that says what the save holds.
-
-    The bare message cannot tell the three usual causes apart: a province id
-    that is not on this map, a wrong ``arena.own_nation``, and an army that
-    simply stands somewhere else.
-    """
-    raw = trn_path.read_bytes()
-    on_map = trn_parse.map_provinces(save_dir)
-    mine = Counter(r['province'] for r in trn_parse.current_unit_records(raw)
-                   if r['nation'] == nation)
-    lines = [f'no units found in {trn_path.name} for provinces {provinces}']
-    if on_map:
-        lines.append(f'  map: {len(on_map)} province(s), ids up to '
-                     f'{max(on_map)}')
-        missing = [p for p in provinces if p not in on_map]
-        if missing:
-            lines.append(f'  not on this map: {missing} -- fix '
-                         f'player.provinces')
-    if mine:
-        where = ', '.join(
-            f'{p} ({n} unit(s))' for p, n in
-            sorted(mine.items(), key=lambda kv: (-kv[1], kv[0]))[:8])
-        lines.append(f'  nation {nation} stands in: {where}')
-    else:
-        lines.append(f'  nation {nation} has no unit in this .trn at all -- '
-                     f'check arena.own_nation')
-    lines.append('  player.provinces = where the army stands now, not where '
-                 'it started the turn')
-    return '\n'.join(lines)
 
 
 def _province_records(raw: bytes, provinces: list[int],
@@ -3562,13 +3529,15 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
 
     # The .trn is the authoritative view of the player's army.  Copy exactly
     # the records standing in the requested provinces.
-    src_units: list[dict] = _province_records(src_raw, province_copy,
-                                              source_nation)
-    if not src_units and not player_report_entries:
-        # Neither a current garrison nor a picked report: the configured
-        # provinces hold nothing of ours.
-        raise ValueError(_no_army_message(trn_path, save_dir, source_nation,
-                                          provinces))
+    # Only the provinces listed in the config are looked at, one by one: a
+    # listed province with no unit of ours (an enemy-held province with
+    # nothing besieged inside) contributes nothing and is skipped.
+    src_units: list[dict] = []
+    for prov in province_copy:
+        got = _province_records(src_raw, [prov], source_nation)
+        print(f'  province {prov}: {len(got)} unit(s) of nation '
+              f'{source_nation}' + ('' if got else ' -- skipped'))
+        src_units.extend(got)
     units_raw = src_raw
     print(f'  unit source: {trn_path.name} '
           f'({len(src_units)} unit(s) of nation {source_nation} '
