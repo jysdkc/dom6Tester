@@ -735,6 +735,30 @@ def _restore_spell_scripts(buf: bytearray, scripts: dict[int, bytes]) -> int:
     return restored
 
 
+def _checked_trn_com(trn_raw: bytes, uid: int) -> dict | None:
+    """``_trn_commander`` with the stale-text guard.
+
+    A .trn also holds stale text/index blocks whose bytes pass the loose
+    ``0x4f + uid`` test (engine log: "Dagan, the Renegade Sage" at .trn offset
+    658507, whose 181-byte body is text, not a com).  A real com tail holds
+    magic paths as 0..15 at 130..139; a bigger byte means the hit is garbage --
+    transplanting it put 26812 in an item slot and the host aborted the whole
+    ftherlnd with "bad equip".  The same garbage in the units section is what
+    the host reports as "gc2" (gettrndta: bad unr), so every .trn lookup must
+    go through this check.
+    """
+    com = _trn_commander(trn_raw, uid)
+    if com is None:
+        return None
+    tail = com.get('tail') or b''
+    bad_paths = len(tail) >= 140 and any(tail[130 + i] > 15 for i in range(10))
+    if len(tail) != 181 or bad_paths:
+        print(f'  NOTE: .trn com candidate for uid {uid} is malformed '
+              f'(paths {list(tail[130:140])}); name and equipment not copied')
+        return None
+    return com
+
+
 def _source_com(h2_raw: bytes | None, trn_raw: bytes, uid: int
                 ) -> dict | None:
     """A source commander's com record, orders file first.
@@ -755,22 +779,7 @@ def _source_com(h2_raw: bytes | None, trn_raw: bytes, uid: int
     # .trn hit for this very uid is the same unit, not a false positive:
     # without it the commander is copied with no name/equipment at all
     # (that is how "Meliath the Fortune Teller" went missing).
-    com = _trn_commander(trn_raw, uid)
-    if com is None:
-        return None
-    # A stale text/index block can still pass _trn_commander's loose
-    # "0x4f + uid" test (engine log: "Dagan, the Renegade Sage" at .trn
-    # offset 658507, whose 181-byte body is text, not a com).  A real com
-    # tail holds magic paths as 0..15 at 130..139; a bigger byte means the
-    # hit is garbage -- transplanting it put 26812 in an item slot and the
-    # host aborted the whole ftherlnd with "bad equip".
-    tail = com.get('tail') or b''
-    bad_paths = len(tail) >= 140 and any(tail[130 + i] > 15 for i in range(10))
-    if len(tail) != 181 or bad_paths:
-        print(f'  NOTE: .trn com candidate for uid {uid} is malformed '
-              f'(paths {list(tail[130:140])}); name and equipment not copied')
-        return None
-    return com
+    return _checked_trn_com(trn_raw, uid)
 
 
 VANILLA_ITEM_MAX = 529   # data/item.trs in a stock Dominions 6 install
@@ -4157,7 +4166,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     player_report_expected_cmdrs = sum(
         1 for r in player_report_records
         if r.get('com') is not None
-        or _trn_commander(trn_raw, r['uid']) is not None)
+        or _checked_trn_com(trn_raw, r['uid']) is not None)
     if player_report_count:
         counts: dict[int, int] = {}
         for t in player_report_units:
@@ -4307,7 +4316,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
         1 for r in enemy_report_records
         if r['comp_index'] != enemy_god_index
         and (r.get('com') is not None
-             or _trn_commander(trn_raw, r['uid']) is not None))
+             or _checked_trn_com(trn_raw, r['uid']) is not None))
     scrubbed = _scrub_commanders(
         raw, base, stride, count, touched, keep,
         limit=_design_array(bytes(raw))[0],
@@ -4736,7 +4745,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             auid = report_uid.get(r['uid'])
             if auid is None:
                 continue
-            com = r.get('com') or _trn_commander(trn_raw, r['uid'])
+            com = r.get('com') or _checked_trn_com(trn_raw, r['uid'])
             if com is None:
                 continue
             com_tail = com.get('tail') or b''
@@ -5030,7 +5039,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             auid = report_uid.get(r['uid'])
             if auid is None:
                 continue
-            com = r.get('com') or _trn_commander(trn_raw, r['uid'])
+            com = r.get('com') or _checked_trn_com(trn_raw, r['uid'])
             if com is None:
                 continue
             com_tail = com.get('tail') or b''

@@ -20,7 +20,7 @@
       95
     ],
     "_provinces说明": "这个是完全拷贝己方xx省的全部单位，装备，脚本。可以多省份，包括被压的城",
-    "start_province": 5,
+    "start_province": 1,
     "_start_province说明": "测试地图上1 2 3 4 陆省，5，6，7海省 8，9 10地下，水国海陆搞错会创建不了。",
     "target_province": 1,
     "_target_province说明": "target_province 默认与 start_province 相同，不同则复制的单位放在 target_province。有时候要测试水国的陆上部队，放首都会死。",
