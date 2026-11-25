@@ -740,21 +740,19 @@ def _checked_trn_com(trn_raw: bytes, uid: int) -> dict | None:
 
     A .trn also holds stale text/index blocks whose bytes pass the loose
     ``0x4f + uid`` test (engine log: "Dagan, the Renegade Sage" at .trn offset
-    658507, whose 181-byte body is text, not a com).  A real com tail holds
-    magic paths as 0..15 at 130..139; a bigger byte means the hit is garbage --
-    transplanting it put 26812 in an item slot and the host aborted the whole
-    ftherlnd with "bad equip".  The same garbage in the units section is what
-    the host reports as "gc2" (gettrndta: bad unr), so every .trn lookup must
-    go through this check.
+    658507, whose 181-byte body is text, not a com).  Transplanting one made
+    the host abort the whole ftherlnd with "bad equip" (26812 in an item slot)
+    or "bad spellist" (text bytes in the five spell slots, e.g. "Fritjof's
+    Archers" / spell 31487), and the same garbage in the units section is what
+    the host reports as "gc2" (gettrndta: bad unr).  Every lookup therefore
+    runs through :func:`_com_tail_ok`, which rejects such a body.
     """
     com = _trn_commander(trn_raw, uid)
     if com is None:
         return None
-    tail = com.get('tail') or b''
-    bad_paths = len(tail) >= 140 and any(tail[130 + i] > 15 for i in range(10))
-    if len(tail) != 181 or bad_paths:
-        print(f'  NOTE: .trn com candidate for uid {uid} is malformed '
-              f'(paths {list(tail[130:140])}); name and equipment not copied')
+    if not _com_tail_ok(com.get('tail') or b''):
+        print(f'  NOTE: .trn com candidate for uid {uid} is a stale text '
+              f'block, not a commander record; name and equipment not copied')
         return None
     return com
 
@@ -772,7 +770,7 @@ def _source_com(h2_raw: bytes | None, trn_raw: bytes, uid: int
     lookup is uid-keyed), not one of the stale-name false positives above.
     """
     com = _trn_commander(h2_raw, uid) if h2_raw else None
-    if com is not None:
+    if com is not None and _com_tail_ok(com.get('tail') or b''):
         return com
     # The orders file can be stale or omit a commander (e.g. a garrison
     # locked in a besieged castle).  _trn_commander is uid-keyed, so a
@@ -823,6 +821,38 @@ def _items_of(tail: bytes) -> list[int]:
         return []
     return [struct.unpack_from('<H', tail, o)[0]
             for o in range(T_ITEMS, T_ITEMS_END, 2)]
+
+
+T_SPELL_SLOT_MAX = 0x4000   # real spell ids sit far below this
+
+
+def _com_tail_ok(tail: bytes) -> bool:
+    """True when ``tail`` is a real 181-byte com tail, not a stale text block.
+
+    A .trn/.2h text block (squad names such as "Fritjof's Archers", province
+    name lists) passes the loose ``0x4f + uid`` match, and its bytes at the
+    magic path positions 130..139 are usually all zero, so the path check
+    alone lets it through -- the host then aborts the whole ftherlnd with
+    "bad spellist" (the text lands on the script slots) or "bad equip" (on
+    the item slots).  Two more fields disqualify it: the 23 equipment slots
+    must hold defined item ids (``0xffff`` is the empty placeholder), and the
+    five battle-script slots must hold a real spell id or an empty/no-order
+    marker.
+    """
+    if len(tail) != COM_TAIL:
+        return False
+    if any(tail[130 + i] > 15 for i in range(10)):
+        return False
+    if any(v and v != 0xFFFF and v > ITEM_MAX_ID for v in _items_of(tail)):
+        return False
+    for k in range(5):
+        v = struct.unpack_from('<H', tail, T_SPELL_SCRIPTS + 2 * k)[0]
+        # 0xfffb..0xffff are the "no spell order" markers real saves use
+        # (0xfffb, 0xfffc, 0xfffd, 0xfffe and the 0xffff terminator).
+        if v == 0 or v < T_SPELL_SLOT_MAX or v >= 0xFFFB:
+            continue
+        return False
+    return True
 
 
 def _sanitize_items(tail: bytearray, who: str) -> bytearray:
@@ -1914,7 +1944,8 @@ def _battle_com_candidates(raw: bytes, rep: dict) -> list[dict]:
     lower case).  A few records in a real save carry a placeholder name in
     lower case ("redmage") or with a space ("sss lock"); a second, relaxed
     pass fills in the uids still missing, guarded by a valid comid and a
-    well-formed tail (magic paths 0..15) so unrelated text cannot qualify.
+    well-formed tail (see :func:`_com_tail_ok`) so unrelated text cannot
+    qualify.
     """
     start = rep['vcr'] + 7
     end = rep['bcd']
@@ -1962,10 +1993,8 @@ def _battle_com_candidates(raw: bytes, rep: dict) -> list[dict]:
                     break
                 if name_start is not None and name_start - 4 >= start:
                     record_start = name_start - 4
-                    tail = raw[uidpos + 24:uidpos + 24 + 181]
-                    if len(tail) == 181 and not (
-                            relaxed
-                            and any(tail[130 + k] > 15 for k in range(10))):
+                    tail = raw[uidpos + 24:uidpos + 24 + COM_TAIL]
+                    if _com_tail_ok(tail):
                         found[uid] = {
                             'start': record_start,
                             'end': uidpos + COM_BODY,
@@ -5194,7 +5223,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
             if owner != arena_nation:
                 continue
             com = _trn_commander(orders, uid)
-            if com is not None and len(com['tail']) == COM_TAIL:
+            if com is not None and _com_tail_ok(com['tail']):
                 scripts[uid] = com['tail'][
                     T_SPELL_SCRIPTS:T_SPELL_SCRIPTS_END]
         spell_scripts[arena_nation] = scripts
