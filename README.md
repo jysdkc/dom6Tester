@@ -11,7 +11,7 @@
 
 项目中的pretender_placeholder.2h不要动
 
-[下载 Dom6Arena.exe](dist/Dom6Arena.exe?raw=true)
+[下载 Dom6Arena.exe](tree/main/dom6arena_standalone/dist/Dom6Arena.exe?raw=true)
 
 放在dominonions6根目录双击运行
 
