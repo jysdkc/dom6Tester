@@ -11,10 +11,13 @@
 
 项目中的pretender_placeholder.2h不要动
 
+[下载 Dom6Arena.exe](dist/Dom6Arena.exe?raw=true)
 
-player.extra_units 这个是添加自定义单位，具体见配置文件注释。默认不用配。
+放在dominonions6根目录双击运行
 
-## 运行
+
+## 从配置文件启动
+
 
 windows控制台进入到dom6arena_standalone目录中
 
@@ -33,6 +36,9 @@ python -m dom6arena.arena_build "arena_config.json"
 ## 参数说明
 
 所有配置都在arena_config.json里面，界面配置好以后也是保存在配置文件中。
+
+
+player.extra_units 这个是添加自定义单位，具体见配置文件注释。默认不用配。
 
 
 <span style="color:#EE0000">arena.save</span> 这个是要测试的存档名称。
