@@ -21,7 +21,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from . import config, gamedata, saveedit, scenario
+from . import config, gamedata, savecrc, saveedit, scenario
 
 ERA_PREFIX = {1: "early", 2: "mid", 3: "late"}
 NEWGAME_FLAGS = ["--nosteam", "--nopopups", "--textonly", "--nocrashbox"]
@@ -374,8 +374,9 @@ def forge_god_file(source: Path, nation: int, out: Path) -> None:
     marker in the mid-file record.  Every com record's magic-path vector is
     also zeroed so the engine does not reject the design as nation-illegal
     (the arena's real paths are written later).  The trailing checksum is
-    left stale; the ``create`` retry loop repairs it from the value the engine
-    logs."""
+    recomputed last (:mod:`savecrc`), so the engine accepts the edited file --
+    6.38 stopped logging the correct value, so it has to be computed here.
+    """
     data = bytearray(_strip_god_password(source.read_bytes()))
     # Zero magic paths BEFORE editing: _strip_god_password may have shifted
     # bytes, so do it once here before any further mutation.
@@ -403,7 +404,7 @@ def forge_god_file(source: Path, nation: int, out: Path) -> None:
             struct.pack_into("<H", data, pos, legal[0])
             pos = data.find(needle, pos + 2)
 
-    out.write_bytes(bytes(data))
+    out.write_bytes(savecrc.fix(bytes(data)))
 
 
 def _repair_god_crc(log: str, sources: dict[str, Path]) -> bool:
@@ -436,6 +437,25 @@ def _repair_god_crc(log: str, sources: dict[str, Path]) -> bool:
         source.write_bytes(bytes(data))
         repaired = True
     return repaired
+
+
+def _fix_god_crc(sources: dict[str, Path]) -> bool:
+    """Recompute every source's trailing checksum; True when one changed.
+
+    The engine validates the same table checksum that :func:`savecrc.calc`
+    reproduces (verified on god files the game saved itself), so a file the
+    engine calls corrupted can be repaired without any help from the log.
+    """
+    changed = False
+    for source in sources.values():
+        if not source.exists():
+            continue
+        data = source.read_bytes()
+        fixed = savecrc.fix(data)
+        if fixed != data:
+            source.write_bytes(fixed)
+            changed = True
+    return changed
 
 
 def create(game: str, era: int, sides: list[tuple[gamedata.Nation, Path]],
@@ -509,12 +529,17 @@ def create(game: str, era: int, sides: list[tuple[gamedata.Nation, Path]],
             last_log = log
             if (save / "ftherlnd").exists():
                 return log
-            # A patched god file fails its checksum; the engine logs the
-            # correct value so repair and retry.  Keep looping until no more
-            # CRC mismatches are found — the engine only ever reports one
-            # corrupted file per run.
+            # A patched god file fails its checksum.  Older engines logged the
+            # correct value (repaired below); 6.38 does not log it any more,
+            # so the checksum is recomputed locally with the same algorithm
+            # the engine uses (see :mod:`savecrc`).  Keep looping until no
+            # more corrupt file is reported — the engine only ever reports
+            # one per run.
             if _repair_god_crc(log, sources):
                 print(f"  repaired .2h checksum, retrying (attempt {attempt + 2})")
+                continue
+            if "is corrupted" in log and _fix_god_crc(sources):
+                print(f"  recomputed .2h checksum, retrying (attempt {attempt + 2})")
                 continue
             break
         if not any(marker in log for marker in CHEAT_MARKERS):

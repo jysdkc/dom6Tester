@@ -41,6 +41,12 @@ NATION_KEYS = {'own_nation', 'enemy_nation'}
 # Shown for reference but not editable: the arena map is a fixed, hand made
 # map folder and every config uses the same one.
 READONLY_KEYS = {'map'}
+# The debug mod exists in two variants that share monsters 9001/9002, so a
+# game may load exactly one: the GUI offers them as radio buttons.
+DEBUG_MOD_OPTIONS = [
+    ('Debug6.dm', 'Debug6（全部法术研究等级 0）'),
+    ('Debug6_normal_research.dm', 'Debug6_normal_research（保持正常研究）'),
+]
 
 
 def _kind(key: str, value) -> str:
@@ -142,6 +148,14 @@ class ArenaGui:
             self._nation_combo(row, section, key, int(value))
             return
 
+        if key == 'debug_mod':
+            var = tk.StringVar(value=str(value))
+            for name, label in DEBUG_MOD_OPTIONS:
+                ttk.Radiobutton(row, text=label, value=name,
+                                variable=var).pack(side='left', padx=(0, 14))
+            self.fields.append((section, key, lambda v=var: v.get()))
+            return
+
         if kind == 'bool':
             var = tk.BooleanVar(value=bool(value))
             ttk.Checkbutton(row, variable=var).pack(side='left')
@@ -207,7 +221,7 @@ class ArenaGui:
         current = var.get().strip()
         initial = start / current if current and (start / current).is_dir() else start
         if not initial.is_dir():
-            initial = config.PROJECT_ROOT
+            initial = config.APP_DIR
         chosen = filedialog.askdirectory(initialdir=str(initial),
                                          title='选择要拷贝的存档文件夹')
         if chosen:
@@ -243,9 +257,13 @@ class ArenaGui:
         try:
             if not self.save(quiet=True):
                 return
-            cmd = [_console_python(), '-m', 'dom6arena.arena_build',
-                   str(self.path)]
-            kwargs = {'cwd': str(config.PROJECT_ROOT)}
+            if config.FROZEN:
+                # A frozen exe cannot run ``-m``: re-launch itself instead.
+                cmd = [sys.executable, '--build', str(self.path)]
+            else:
+                cmd = [_console_python(), '-m', 'dom6arena.arena_build',
+                       str(self.path)]
+            kwargs = {'cwd': str(config.APP_DIR)}
             if sys.platform == 'win32':
                 # cmd /k keeps the console (and any traceback) on screen after
                 # the build ends, so a failure is never silent.
@@ -321,9 +339,9 @@ def _json_value(widget: tk.Text, key: str, empty) -> object:
 
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
-    path = Path(argv[0]) if argv else Path('arena_config.json')
+    path = Path(argv[0]) if argv else Path(config.CONFIG_PATH.name)
     if not path.is_absolute():
-        path = config.PROJECT_ROOT / path
+        path = config.APP_DIR / path
     if not path.is_file():
         raise SystemExit(f'config not found: {path}')
     root = tk.Tk()

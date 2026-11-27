@@ -793,7 +793,7 @@ T_ITEMS_END = 46
 
 def _item_max_from_mods(mods) -> int:
     """Largest item id defined by the loaded mods (vanilla floor 529)."""
-    root = Path(__file__).resolve().parent.parent / 'resources' / 'mods'
+    root = config.RESOURCES_DIR / 'mods'
     best = VANILLA_ITEM_MAX
     for mod in mods:
         p = root / str(mod)
@@ -1451,14 +1451,10 @@ def _god_file_for(nation: gamedata.Nation) -> Path:
     ``--newgame`` needs a pretender submission for both human nations.  A
     fixed placeholder shipped with the project is relabeled to ``nation`` and
     written under ``output/``; the user's ``savedgames/newlords`` is never
-    read or written.  ``newgame.create`` repairs the checksum on its first
-    run, after which the existing file is reused as-is.
+    read or written.  It is regenerated on every build (the file is tiny), so
+    a stale copy with an outdated checksum cannot survive a game update.
     """
     out = config.ensure_output_dir() / f'{nation.file_name_base}_placeholder.2h'
-    if out.exists():
-        data = out.read_bytes()
-        if struct.unpack_from('<H', data, 26)[0] == nation.id:
-            return out
     source = config.PROJECT_ROOT / 'resources' / 'pretender_placeholder.2h'
     if not source.is_file():
         raise FileNotFoundError(
@@ -1705,6 +1701,157 @@ def _check_mods(mods: list[str]) -> None:
         raise ValueError(
             f'the game enabled mods {enabled}, config asks for {expected}; '
             f'check the "mods" entries in the config')
+
+
+_DM_TAIL = bytes(ord(c) ^ XOR for c in '.dm')
+_DEBUG_MOD_PREFIX = 'debug6'
+# Exactly one of these is loaded in every arena: both define monsters
+# 9001/9002, so loading the pair clashes.  The difference is only whether
+# every spell's research level is forced to 0.
+DEBUG_MODS = ('Debug6.dm', 'Debug6_normal_research.dm')
+# The shipped one-age mod is loaded in every arena (it ships in
+# resources/mods), so all early/middle/late nations exist in one era.  A
+# OneAge variant recorded by the source save is not loaded in its place: two
+# one-age mods fight over the same nation ids.
+_ONE_AGE_NAME = 'OneAge_EAMALA.dm'
+_ONE_AGE_PREFIX = 'oneage'
+
+
+def _installed_mods() -> dict[str, list[Path]]:
+    """Every .dm the engine can load, keyed by file name.
+
+    The engine resolves ``-M`` entries against the user mod folder and, for
+    workshop subscriptions, against the workshop content folder.
+    """
+    index: dict[str, list[Path]] = {}
+    for root in (config.mods_dir(), config.workshop_dir()):
+        if not root.is_dir():
+            continue
+        for path in root.rglob('*.dm'):
+            if len(path.relative_to(root).parts) <= 3:
+                index.setdefault(path.name, []).append(path)
+    return index
+
+
+def _mod_entry(name: str, paths: list[Path]) -> str:
+    """The ``-M`` entry for a mod file: folder form, bare name or workshop id."""
+    mods_root = config.mods_dir()
+    for path in paths:
+        if path.parent.parent == mods_root and path.parent.name != 'mods':
+            return f'{path.parent.name}/{name}'
+    for path in paths:
+        if path.parent == mods_root:
+            return name
+    for path in paths:
+        parts = path.relative_to(config.workshop_dir()).parts
+        if len(parts) >= 2:
+            return f'{parts[0]}/{name}'
+    return name
+
+
+def _save_mod_names(raw: bytes,
+                    index: dict[str, list[Path]]) -> tuple[list[str], list[str]]:
+    """Mod file names recorded in a .trn, in load order, plus unknown text.
+
+    The save stores the name NUL-terminated inside the same XOR-0x4F encoding
+    as unit names.  Zero padding around it decodes to ``O`` and a real leading
+    ``O`` is stored as a zero byte, so a decoded string is only a candidate:
+    the mod is the installed .dm file that string ends with.
+    """
+    installed = sorted(index, key=len, reverse=True)
+    names: list[str] = []
+    unknown: list[str] = []
+    pos = raw.find(_DM_TAIL)
+    while pos >= 0:
+        end = pos + len(_DM_TAIL)
+        if end < len(raw) and raw[end] == XOR:
+            start, steps = pos, 0
+            while start > 0 and steps < 90:
+                if not 32 <= (raw[start - 1] ^ XOR) < 127:
+                    break
+                start -= 1
+                steps += 1
+            text = bytes(b ^ XOR for b in raw[start:end]).decode('latin1')
+            if len(text) > 4:
+                name = next((n for n in installed if text.endswith(n)), None)
+                if name is None:
+                    if text not in unknown:
+                        unknown.append(text)
+                elif name not in names:
+                    names.append(name)
+        pos = raw.find(_DM_TAIL, pos + 1)
+    return names, unknown
+
+
+def _source_mods(save: str) -> list[str]:
+    """``-M`` entries the source save was hosted with, in load order.
+
+    Read from the save's own .trn files, so a source that uses workshop or
+    hand-installed mods needs no ``mods`` entry in the config.  Two kinds are
+    dropped here: debug mods (``debug_mod`` picks the one variant the arena
+    runs, loading both is a 9001/9002 clash) and every one-age mod (the arena
+    always loads the shipped ``OneAge_EAMALA`` instead, see ``_resolve_mods``).
+    """
+    save_dir = config.saved_games_dir() / save
+    index = _installed_mods()
+    entries: list[str] = []
+    unknown: list[str] = []
+    for trn in sorted(save_dir.glob('*.trn')):
+        names, missing = _save_mod_names(trn.read_bytes(), index)
+        for text in missing:
+            if text not in unknown:
+                unknown.append(text)
+        for name in names:
+            entry = _mod_entry(name, index[name])
+            if entry not in entries:
+                entries.append(entry)
+    if unknown:
+        raise ValueError(
+            f'the save "{save}" was hosted with {", ".join(unknown)}, which is '
+            f'not installed; subscribe to it or list "mods" explicitly')
+    return [e for e in entries if not _arena_managed_mod(e)]
+
+
+def _arena_managed_mod(entry: str) -> bool:
+    """A mod the arena decides itself: debug variants and every one-age mod."""
+    name = Path(entry).name.lower()
+    return name.startswith(_DEBUG_MOD_PREFIX) or _ONE_AGE_PREFIX in name
+
+
+def _one_age_entry(index: dict[str, list[Path]] | None = None) -> str:
+    """The ``-M`` entry of the shipped OneAge mod.
+
+    It lives in ``mods/OneAge_EAMALA/OneAge_EAMALA.dm`` after the first-run
+    copy, so the engine needs the folder form; the bare name is the fallback
+    for a hand-installed copy at the mod root.
+    """
+    index = _installed_mods() if index is None else index
+    paths = index.get(_ONE_AGE_NAME, [])
+    return _mod_entry(_ONE_AGE_NAME, paths) if paths else _ONE_AGE_NAME
+
+
+def _resolve_mods(cfg: dict, save: str) -> list[str]:
+    """The ``-M`` list for arena creation.
+
+    The shipped one-age mod is always loaded (the arena map pins nation ids
+    from every era), and exactly one debug variant runs.  ``mods`` empty means
+    "same as the source save"; either way a one-age or debug mod that came
+    from the save or the list is replaced instead of added to.
+    """
+    mods = list(cfg.get('mods') or [])
+    if not mods:
+        mods = _source_mods(save)
+        print(f'mods from the source save: {mods}')
+    chosen = Path(str(cfg.get('debug_mod') or DEBUG_MODS[0])).name
+    if chosen not in DEBUG_MODS:
+        raise ValueError(
+            f'debug_mod must be one of {list(DEBUG_MODS)}, got '
+            f'{cfg.get("debug_mod")!r}')
+    kept = [m for m in mods if not _arena_managed_mod(m)]
+    if len(kept) != len(mods):
+        print('  one-age/debug mods replaced by the shipped OneAge_EAMALA '
+              f'and {chosen}')
+    return kept + [_one_age_entry(), chosen]
 
 
 # Vanilla nations that start under water (the one-age mods keep the ids).
@@ -3513,7 +3660,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
     player_cfg = cfg.get('player') or cfg.get('source') or {}
     provinces = [int(p) for p in player_cfg['provinces']]
     enemy_cfg = cfg.get('enemy') or {}
-    mods = cfg.get('mods') or []
+    mods = _resolve_mods(cfg, arena['save'])
     global ITEM_MAX_ID
     ITEM_MAX_ID = _item_max_from_mods(mods)
 
@@ -3661,7 +3808,7 @@ def build(cfg: dict, indepstr: int = 0) -> dict:
 
     save = config.save_dir(game)
     ft = save / 'ftherlnd'
-    backup = config.OUTPUT_DIR / f'{game}_ftherlnd_before_swap.bin'
+    backup = config.ensure_output_dir() / f'{game}_ftherlnd_before_swap.bin'
     shutil.copyfile(ft, backup)
     print(f'NOTE: {backup.name} refreshed from the new ftherlnd')
     shutil.copyfile(backup, ft)
@@ -5397,7 +5544,7 @@ def main(config_path: str | Path, attempts: int = 30) -> dict:
 
 
 if __name__ == '__main__':
-    # No argument: use the config next to this checkout, whether the tool is
-    # started from the project root or from inside the package.
-    default = Path(__file__).resolve().parent.parent / 'arena_config.json'
-    main(sys.argv[1] if len(sys.argv) > 1 else str(default))
+    # No argument: use the config next to the exe (frozen) or next to this
+    # checkout, whether the tool is started from the project root or from
+    # inside the package.
+    main(sys.argv[1] if len(sys.argv) > 1 else str(config.CONFIG_PATH))
