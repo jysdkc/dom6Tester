@@ -2883,6 +2883,31 @@ def _enemy_army(raw: bytes, enemy_cfg: dict,
     cmdrs: list[dict] = []
     explicit_god = bool(enemy_cfg.get('pretender'))
     god: dict | None = None
+    # Synthetic source uids for mounts a scout report only implies.  A report
+    # names the rider type, never its mount; ``mountmnr`` in units.csv is the
+    # mount type.  The pair needs a link at +81, and _apply_master_chain only
+    # rewrites links written as a positive source uid, so each synthesized
+    # rider gets an id no real .trn uid can collide with.
+    synthetic_uid = 9_000_000
+
+    def scout_specs(unit_type: int) -> list[int | dict]:
+        """Rider (and its mount) for a unit known only by type.
+
+        Visible .trn records carry their own mount chain and never come here.
+        A mounted type is written as a rider spec plus a mount spec, exactly
+        like the battle-report path appends VCR mounts: without the extra
+        record the host keeps the rider bare (Bird Knights lost their War
+        Birds, Heavy Cavalry their Destriers).
+        """
+        nonlocal synthetic_uid
+        unit = gamedata.units()[unit_type]
+        if not unit.mount:
+            return [unit_type]
+        synthetic_uid += 1
+        src = synthetic_uid
+        return [{'type': unit_type, 'master': -2, 'rider': 1,
+                 'src_uid': src},
+                {'type': unit.mount, 'master': src, 'rider': 0}]
 
     def add(unit_type: int, count: int, where: str,
             spec: dict | None = None) -> None:
@@ -2910,14 +2935,18 @@ def _enemy_army(raw: bytes, enemy_cfg: dict,
             if spec is not None:
                 army.append(spec)
             else:
-                army.extend([unit_type] * count)
+                for _ in range(count):
+                    army.extend(scout_specs(unit_type))
             return
         for _ in range(count):
             cmdrs.append({'id': unit_type, 'index': len(army),
                           'label': f'{where}: {unit.name}',
                           'name': unit.name, 'paths': unit.paths,
                           'cmdr_override': True, 'base': 0})
-            army.append(spec if spec is not None else unit_type)
+            if spec is not None:
+                army.append(spec)
+            else:
+                army.extend(scout_specs(unit_type))
 
     provs = enemy_cfg.get('provinces') or []
     if isinstance(provs, int):

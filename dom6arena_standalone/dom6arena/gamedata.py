@@ -36,6 +36,7 @@ class Unit:
     unique: bool = False
     fixedname: str = ""
     immobile: bool = False
+    mount: int = 0
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ def units() -> dict[int, Unit]:
             unique=number("unique") != 0,
             fixedname=cell(row, "fixedname", ""),
             immobile=number("immobile") != 0,
+            mount=number("mountmnr"),
         )
     return result
 

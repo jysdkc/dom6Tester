@@ -315,27 +315,49 @@ def scout_total(raw: bytes, province_id: int) -> int | None:
 # prefixes.  Generating all forms is safe because no two different unit names
 # share a plural (checked against data/units.csv).
 # --------------------------------------------------------------------------
-def _plural_forms(name: str) -> set[str]:
-    """Plural spellings the game can print for ``name``.
+def _plural_word(word: str) -> set[str]:
+    """Plural spellings the game can print for one word.
 
     Covers the regular "+s"/"+es", consonant+"y" -> "ies" (Harpy/Harpies),
     "man" -> "men" (Crossbowman/Crossbowmen), "f"/"fe" -> "ves"
     (Wolf/Wolves) and the Latin plurals of "is"/"us" names.
     """
-    forms = {name + "s", name + "es"}
-    if len(name) > 1:
-        if name.endswith("y") and name[-2].lower() not in "aeiou":
-            forms.add(name[:-1] + "ies")
-        if name.endswith("man"):
-            forms.add(name[:-3] + "men")
-        if name.endswith("f"):
-            forms.add(name[:-1] + "ves")
-        if name.endswith("fe"):
-            forms.add(name[:-2] + "ves")
-        if name.endswith("is"):
-            forms.add(name[:-2] + "es")
-        if name.endswith("us"):
-            forms.add(name[:-2] + "i")
+    forms = {word + "s", word + "es"}
+    if len(word) > 1:
+        if word.endswith("y") and word[-2].lower() not in "aeiou":
+            forms.add(word[:-1] + "ies")
+        if word.endswith("man"):
+            forms.add(word[:-3] + "men")
+        if word.endswith("f"):
+            forms.add(word[:-1] + "ves")
+        if word.endswith("fe"):
+            forms.add(word[:-2] + "ves")
+        if word.endswith("is"):
+            forms.add(word[:-2] + "es")
+        if word.endswith("us"):
+            forms.add(word[:-2] + "i")
+    return forms
+
+
+def _plural_forms(name: str) -> set[str]:
+    """Plural spellings the game can print for ``name``.
+
+    A plain name is pluralized on its last word ("Mother Guard" ->
+    "Mother Guards").  In a name built as "<head> of <rest>" the head noun is
+    the one the engine pluralizes, not the last word: a sighted garrison of
+    King of the Deep (322) prints "5 huge Kings of the Deep were seen
+    towering over the army", never "King of the Deeps".  The head is the last
+    word before " of " (Alchemical Amalgam of Air -> Alchemical Amalgams of
+    Air, Knight Commander of Avalon -> Knight Commanders of Avalon), so both
+    spellings are generated for such names.
+    """
+    forms = _plural_word(name)
+    head, sep, rest = name.partition(" of ")
+    if sep:
+        prefix, _, noun = head.rpartition(" ")
+        for plural in _plural_word(noun):
+            forms.add(f"{prefix} {plural}{sep}{rest}" if prefix
+                      else f"{plural}{sep}{rest}")
     return forms
 
 
